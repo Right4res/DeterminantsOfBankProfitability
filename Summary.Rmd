@@ -1,0 +1,3080 @@
+---
+title: "Summary Stats"
+author: "Philip Ridgill"
+date: "23/02/2020"
+output: 
+  html_document:
+    df_print: paged
+    code_folding: hide
+    highlight: kate
+    theme: lumen
+    toc: yes
+    toc_float: yes
+---
+```{r setup, include=FALSE}
+# packages
+library(plm)
+library(lmtest)
+library(sandwich)
+library(scales)
+library(Hmisc)
+library(corrplot)
+library(robustHD)
+library(statar)
+library(directlabels)
+library(stargazer)
+library(caret)
+library(leaps)
+library(olsrr)
+library(GGally)
+library(gridExtra)
+library(plotly)
+library(Cairo)
+library(tidyverse)
+
+
+
+# import data
+setwd("C:/Users/phili/OneDrive/UNI/3rd Year/ES30029/Determinants of bank profitability/Data")
+data_raw <- read.csv("data4.csv", stringsAsFactors=FALSE)
+macro <- read.csv("macro.csv", stringsAsFactors=FALSE)
+data_stata <- read.csv("data_short3.csv", stringsAsFactors=FALSE)
+residual <- read.csv("data_residual.csv")
+residual_two_way <- read.csv("residual_heteroskedasticity.csv")
+random <- read.csv("random.csv")
+fredgraph <- read.csv("fredgraph.csv")
+FEDFUNDS <- read.csv("FEDFUNDS.csv") 
+econ_sig_roe <- read.csv("econ_sig_roe.csv")
+econ_sig_roa <- read.csv("econ_sig_roa.csv")
+
+fredgraph <- fredgraph %>%
+  rename(Date = DATE,
+         RoE = USROE,
+         RoA = USROA) %>%
+  mutate(Date = as.character(Date),
+         Date = as.Date(Date, format = "%d/%m/%Y"))
+
+FEDFUNDS <- FEDFUNDS %>%
+   rename(Date = DATE) %>%
+   mutate(Date = as.character(Date),
+         Date = as.Date(Date, format = "%d/%m/%Y"))
+
+data_raw <- data_raw %>%
+  left_join(macro, by = "Year")
+
+# solve formatting
+colnames(data_raw)[1] <- "Bank"
+
+# replaced NAs manually
+data_raw[data_raw == "NULL"] <- NA
+data_raw[data_raw == "#N/A"] <- NA
+data_raw[data_raw == "Unable to resolve and collect data for all requested identifiers and fields."] <- NA
+#data_raw[data_raw == ""] <- NA
+data_raw[7:31][data_raw[7:31] == "Retrieving..."] <- NA
+
+#write and read data to get numerics and factors
+write.csv(data_raw, "Clean_data.csv", row.names = FALSE)
+data_raw <- read.csv("Clean_data.csv")
+
+data_raw$Date <- as.Date(data_raw$Date, format = "%d/%m/%Y")
+#data_raw[7:24] <- sapply(data_raw[7:24],as.numeric)
+#data_raw[26:31] <- sapply(data_raw[26:31],as.numeric)
+
+
+## data availability
+
+data <- data_raw %>%
+  mutate(LoanLossProv_pct = LoanLossProv/Loans,
+         NonPerfLoans_pct = NonPerfLoans/Loans,
+         LoanstoTA = Loans/TA,
+         NII_pct = NII/(NII+NonIntInc),
+         LeverageRatio = Equity/TA,
+         T1LeverageRatio = T1/TA,
+         LongTermDebt_pct = LongTermDebt/Liabilities)
+
+# want to remove banks with no loans etc. 
+
+data <- data %>% filter(TA > 0) %>% filter(!is.na(Type)) %>% filter(!is.na(Loans)) %>% 
+  filter(!is.na(RoE)) %>% filter(!is.na(RoA))
+
+summary_type <- data %>%
+  group_by(Type) %>%
+  summarise(count = n(),
+            mean_TA = mean(TA, na.rm = TRUE),
+            Q.1st = quantile(TA, 0.25),
+            Q.2nd = quantile(TA, 0.5),
+            Q.3rd = quantile(TA, 0.75))
+
+
+data <- data %>% filter(Type != "")
+
+data_2018 <- data %>% filter(Year == "2018")
+
+
+summary <- data %>% group_by(Bank) %>%
+  summarise(count = n()) 
+
+# want to remove all of the samples for a company with missing data, not only half or something. 
+
+to_remove <- summary %>%
+  filter(count < 9) %>%
+  mutate(to_remove = 1)
+
+data <- data %>% left_join(to_remove) %>%
+  filter(is.na(to_remove)) %>% select(-"to_remove", - "count")
+
+
+
+sapply(data, function(x) sum(is.na (x))) / 9
+
+
+## select key columns to use
+
+data_select <- data %>%
+  select(1:4, 25, 7, 32:33, 31, 39, 30, 19, 41:42, 22, 37:38, 43, 34:36) %>%
+  mutate(not_ComBank = if_else(Type == "Commercial Banking", 0, 1))
+
+
+data_select_2018 <- data_select %>%
+  filter(Year == 2018)
+
+data_short <- data_select %>%
+  select(1:2, 6:21)
+
+
+
+data_short$Bank <- droplevels(data_short$Bank, exclude = if(anyNA(levels(data_short$Bank))) NULL else NA)
+
+data_short <- data_short %>%
+  mutate(Bank = fct_reorder(Bank, TA),
+         id = fct_anon(Bank),
+         id = as.character(id),
+         id = as.numeric(id))
+
+data_short <- data_short %>%
+  select(19, 1:18)
+
+# calculating estimated Risk weight
+
+data_stata <- data_stata %>%
+  mutate(est_T1LR = 0.85*LeverageRatio,
+         est_T1LR = if_else(is.na(T1LeverageRatio)!=TRUE, T1LeverageRatio, est_T1LR),
+         est_RW = 100*((TA*est_T1LR)/(T1_pct/100)/TA))
+
+data_stata_size_summary <- data_stata %>%
+  group_by(id) %>%
+  summarise(TA = median(TA, na.rm=TRUE)) %>%
+  mutate(TA_large = if_else(TA >= quantile(TA, 0.5), 1, 0),
+         TA_small = if_else(TA < quantile(TA, 0.5), 1, 0)) %>%
+  select(-TA)
+
+macro_FED <- macro %>%
+  select(Year, FED_rate)
+
+data_stata <- data_stata %>%
+  left_join(macro_FED, by = c("Year")) %>%
+  left_join(data_stata_size_summary, by = c("id"))
+
+
+#### winsorizing ####
+
+data_stata_win <- data_stata %>%
+  mutate(LtD = winsorize(LtD, probs = c(0.005, 0.995)),
+         RoE = winsorize(RoE, probs = c(0.005, 0.995)),
+         RoA = winsorize(RoA, probs = c(0.005, 0.995)),
+         NonIntInc_pct = winsorize(NonIntInc_pct, probs = c(0.005, 0.995)),
+         Efficiency = winsorize(Efficiency, probs = c(0.005, 0.995)),
+         LeverageRatio = winsorize(LeverageRatio, probs = c(0.005, 0.995)),
+         T1_pct = winsorize(T1_pct, probs = c(0.005, 0.995)),
+         LoanLossProv_pct = winsorize(LoanLossProv_pct, probs = c(0.005, 0.995)),
+         LongTermDebt_pct = winsorize(LongTermDebt_pct, probs = c(0.005, 0.995)),
+         LoanstoTA = winsorize(LoanstoTA, probs = c(0.005, 0.995)),
+         NonPerfLoans_pct = winsorize(NonPerfLoans_pct, probs = c(0.005, 0.995)),
+         est_T1LR = 0.85*LeverageRatio,
+         est_T1LR = if_else(is.na(T1LeverageRatio)!=TRUE, T1LeverageRatio, est_T1LR),
+         est_RW = 100*((TA*est_T1LR)/(T1_pct/100)/TA))
+
+
+#write.csv(data_stata_win, "data_short4_win.csv", row.names = FALSE)
+
+#### end ####
+
+#### YoY changes ####
+
+data_stata_changes <- data_stata_win %>%
+  group_by(id) %>%
+  arrange(Year) %>%
+  mutate(TA = log(TA),
+         TA = TA-lag(TA),
+         RoE = RoE-lag(RoE),
+         RoA = RoA-lag(RoA),
+         LtD = LtD-lag(LtD),
+         LoanstoTA = LoanstoTA-lag(LoanstoTA),
+         NonIntInc_pct = NonIntInc_pct-lag(NonIntInc_pct),
+         Efficiency = Efficiency-lag(Efficiency),
+         LeverageRatio = LeverageRatio-lag(LeverageRatio),
+         T1LeverageRatio = T1LeverageRatio-lag(T1LeverageRatio),
+         T1_pct = T1_pct-lag(T1_pct),
+         LoanLossProv_pct = LoanLossProv_pct-lag(LoanLossProv_pct),
+         NonPerfLoans_pct = NonPerfLoans_pct-lag(NonPerfLoans_pct),
+         LongTermDebt_pct = LongTermDebt_pct-lag(LongTermDebt_pct),
+         est_RW = est_RW-lag(est_RW)) %>%
+  filter(Year != 2010) %>%
+  ungroup()
+
+
+data_stata_changes_reg <- data_stata_changes %>%
+  mutate(LoanstoTA = LoanstoTA*100,
+         NonIntInc_pct = NonIntInc_pct*100,
+         T1LeverageRatio = T1LeverageRatio*100,
+         LoanLossProv_pct = LoanLossProv_pct*100,
+         NonPerfLoans_pct = NonPerfLoans_pct*100,
+         LongTermDebt_pct = LongTermDebt_pct*100,
+         LtD = LtD*100,
+         LeverageRatio = LeverageRatio*100)
+
+data_stata_changes_reg  <- pdata.frame(data_stata_changes_reg, index = c("id", "Year"))
+
+#write.csv(data_stata_changes, "data_short5_changes.csv", row.names = FALSE)
+
+#### end ####
+
+#### Year lag ####
+
+data_stata_lag <- data_stata_win %>%
+  group_by(id) %>%
+  arrange(Year) %>%
+  mutate(TA = log(TA),
+         TA = lag(TA),
+         RoE = RoE,
+         RoA = RoA,
+         LtD = lag(LtD),
+         LoanstoTA = lag(LoanstoTA),
+         NonIntInc_pct = lag(NonIntInc_pct),
+         Efficiency = lag(Efficiency),
+         LeverageRatio = lag(LeverageRatio),
+         T1LeverageRatio = lag(T1LeverageRatio),
+         T1_pct = lag(T1_pct),
+         LoanLossProv_pct = lag(LoanLossProv_pct),
+         NonPerfLoans_pct = lag(NonPerfLoans_pct),
+         LongTermDebt_pct = lag(LongTermDebt_pct)) %>%
+  filter(Year != 2010) %>%
+  ungroup()
+
+data_stata_lag_reg <- data_stata_lag %>%
+  mutate(LoanstoTA = LoanstoTA*100,
+         NonIntInc_pct = NonIntInc_pct*100,
+         T1LeverageRatio = T1LeverageRatio*100,
+         LoanLossProv_pct = LoanLossProv_pct*100,
+         NonPerfLoans_pct = NonPerfLoans_pct*100,
+         LongTermDebt_pct = LongTermDebt_pct*100,
+         LtD = LtD*100,
+         LeverageRatio = LeverageRatio*100)
+
+data_stata_lag_reg  <- pdata.frame(data_stata_lag_reg, index = c("id", "Year"))
+
+
+#write.csv(data_stata_lag, "data_short6_lag.csv", row.names = FALSE)
+
+
+#### end ####
+
+#write.csv(data_short, "data_short2.csv", row.names = FALSE)
+
+## examine data
+
+data_2018 <- data %>% filter(Year == "2018")
+
+summary_2018 <- data_2018 %>%
+    summarise(
+            mean_TA = mean(TA, na.rm = TRUE),
+            mean_LtD = mean(LtD, na.rm = TRUE),
+            mean_LoanstoTA = mean(LoanstoTA, na.rm = TRUE),
+            mean_LongTermDebt_pct = mean(LongTermDebt_pct, na.rm = TRUE))
+
+# for correlation matrix
+
+## 2018
+
+cor_data_2018 <- data_2018 %>% select(7:9, 17, 19, 22, 27:33, 37:43) %>%
+  mutate(TA = log(TA))
+
+cor_data_select_2018 <- data_select_2018 %>% select(6:15, 17:18) %>%
+  mutate(TA = log(TA))
+
+cor_select <- cor(cor_data_select_2018, use = "complete.obs")
+rcor_select <- rcorr(as.matrix(cor_data_select_2018))
+
+rcor_select_DF <- as.data.frame(rcor_select$P)
+
+## only variables used in regression
+
+cor_data_stata_2018 <- cor_data_select_2018 %>% select(1:7, 9:11)
+
+cor_stata <- cor(cor_data_stata_2018, use = "complete.obs")
+rcor_stata <- rcorr(as.matrix(cor_data_stata_2018))
+
+rcor_stata_DF <- as.data.frame(rcor_stata$P)
+
+## end 2018
+
+## All years - winsorized
+
+cor_data_stata_win <- data_stata_win %>% select(TA:GDP_pct, est_RW) %>%
+  mutate(TA = log(TA))
+
+cor_data_stata_win <- cor_data_stata_win %>% select(TA:LeverageRatio, T1_pct:LongTermDebt_pct, est_RW)
+
+cor_stata_win <- cor(cor_data_stata_win, use = "complete.obs")
+rcor_stata_win <- rcorr(as.matrix(cor_data_stata_win))
+
+rcor_stata_win_DF <- as.data.frame(rcor_stata_win$P)
+
+
+## First difference correlogram 
+
+cor_data_stata_changes <- data_stata_changes %>% select(TA:GDP_pct, est_RW)
+
+cor_data_stata_changes <- cor_data_stata_changes %>% select(TA:LeverageRatio, T1_pct:LoanLossProv_pct:LongTermDebt_pct, est_RW)
+
+cor_stata_changes <- cor(cor_data_stata_changes, use = "complete.obs")
+rcor_stata_changes <- rcorr(as.matrix(cor_data_stata_changes))
+
+rcor_stata_changes_DF <- as.data.frame(rcor_stata_changes$P)
+
+
+## Average of each year correlation
+
+
+cor_data_stata_win_year <- data_stata_win %>% select(Year, TA:GDP_pct) %>%
+  mutate(TA = log(TA)) %>% 
+  select(Year, TA:LeverageRatio, T1_pct:NonPerfLoans_pct, LongTermDebt_pct)
+
+#2010
+cor_data_stata_win_2010 <- cor_data_stata_win_year %>%
+  filter(Year == 2010) %>%
+  select(-Year)
+
+cor_stata_win_2010 <- cor(cor_data_stata_win_2010, use = "complete.obs")
+
+cor_stata_win_2010_DF <- as.data.frame(cor_stata_win_2010) %>%
+  mutate(Year = 2010,
+         Variable = rownames(cor_stata_win_2010)) %>%
+  select(Year:Variable,TA:LongTermDebt_pct)
+
+#2011
+cor_data_stata_win_2011 <- cor_data_stata_win_year %>%
+  filter(Year == 2011) %>%
+  select(-Year)
+
+cor_stata_win_2011 <- cor(cor_data_stata_win_2011, use = "complete.obs")
+
+cor_stata_win_2011_DF <- as.data.frame(cor_stata_win_2011) %>%
+  mutate(Year = 2011,
+         Variable = rownames(cor_stata_win_2011)) %>%
+  select(Year:Variable,TA:LongTermDebt_pct)
+
+#2012
+cor_data_stata_win_2012 <- cor_data_stata_win_year %>%
+  filter(Year == 2012) %>%
+  select(-Year)
+
+cor_stata_win_2012 <- cor(cor_data_stata_win_2012, use = "complete.obs")
+
+cor_stata_win_2012_DF <- as.data.frame(cor_stata_win_2012) %>%
+  mutate(Year = 2012,
+         Variable = rownames(cor_stata_win_2012)) %>%
+  select(Year:Variable,TA:LongTermDebt_pct)
+
+#2013
+cor_data_stata_win_2013 <- cor_data_stata_win_year %>%
+  filter(Year == 2013) %>%
+  select(-Year)
+
+cor_stata_win_2013 <- cor(cor_data_stata_win_2013, use = "complete.obs")
+
+cor_stata_win_2013_DF <- as.data.frame(cor_stata_win_2013) %>%
+  mutate(Year = 2013,
+         Variable = rownames(cor_stata_win_2013)) %>%
+  select(Year:Variable,TA:LongTermDebt_pct)
+
+#2014
+cor_data_stata_win_2014 <- cor_data_stata_win_year %>%
+  filter(Year == 2014) %>%
+  select(-Year)
+
+cor_stata_win_2014 <- cor(cor_data_stata_win_2014, use = "complete.obs")
+
+cor_stata_win_2014_DF <- as.data.frame(cor_stata_win_2014) %>%
+  mutate(Year = 2014,
+         Variable = rownames(cor_stata_win_2014)) %>%
+  select(Year:Variable,TA:LongTermDebt_pct)
+
+#2015
+cor_data_stata_win_2015 <- cor_data_stata_win_year %>%
+  filter(Year == 2015) %>%
+  select(-Year)
+
+cor_stata_win_2015 <- cor(cor_data_stata_win_2015, use = "complete.obs")
+
+cor_stata_win_2015_DF <- as.data.frame(cor_stata_win_2015) %>%
+  mutate(Year = 2015,
+         Variable = rownames(cor_stata_win_2015)) %>%
+  select(Year:Variable,TA:LongTermDebt_pct)
+
+#2016
+cor_data_stata_win_2016 <- cor_data_stata_win_year %>%
+  filter(Year == 2016) %>%
+  select(-Year)
+
+cor_stata_win_2016 <- cor(cor_data_stata_win_2016, use = "complete.obs")
+
+cor_stata_win_2016_DF <- as.data.frame(cor_stata_win_2016) %>%
+  mutate(Year = 2016,
+         Variable = rownames(cor_stata_win_2016)) %>%
+  select(Year:Variable,TA:LongTermDebt_pct)
+
+#2017
+cor_data_stata_win_2017 <- cor_data_stata_win_year %>%
+  filter(Year == 2017) %>%
+  select(-Year)
+
+cor_stata_win_2017 <- cor(cor_data_stata_win_2017, use = "complete.obs")
+
+cor_stata_win_2017_DF <- as.data.frame(cor_stata_win_2017) %>%
+  mutate(Year = 2017,
+         Variable = rownames(cor_stata_win_2017)) %>%
+  select(Year:Variable,TA:LongTermDebt_pct)
+
+#2018
+cor_data_stata_win_2018 <- cor_data_stata_win_year %>%
+  filter(Year == 2018) %>%
+  select(-Year)
+
+cor_stata_win_2018 <- cor(cor_data_stata_win_2018, use = "complete.obs")
+
+cor_stata_win_2018_DF <- as.data.frame(cor_stata_win_2018) %>%
+  mutate(Year = 2018,
+         Variable = rownames(cor_stata_win_2018)) %>%
+  select(Year:Variable,TA:LongTermDebt_pct)
+
+#create average
+cor_stata_win_year <- (cor_stata_win_2018 + cor_stata_win_2017 + cor_stata_win_2016 + cor_stata_win_2015 + cor_stata_win_2014 + cor_stata_win_2013 + cor_stata_win_2012 + cor_stata_win_2011 + cor_stata_win_2010)/9
+
+rcor_stata_win_year <- rcorr(as.matrix(cor_stata_win_year))
+
+rcor_stata_win_year_DF <- as.data.frame(rcor_stata_win_year$P)
+
+#create data frame with all
+
+
+cor_stata_win_year_DF <- rbind(cor_stata_win_2010_DF, cor_stata_win_2011_DF, cor_stata_win_2012_DF, cor_stata_win_2013_DF, cor_stata_win_2014_DF, cor_stata_win_2015_DF, cor_stata_win_2016_DF, cor_stata_win_2017_DF, cor_stata_win_2018_DF)
+
+## data frame for regression (winsorised sample)
+
+data_stata_win_reg <- data_stata_win %>%
+  mutate(TA = log(TA),
+         LoanstoTA = LoanstoTA*100,
+         NonIntInc_pct = NonIntInc_pct*100,
+         T1LeverageRatio = T1LeverageRatio*100,
+         LoanLossProv_pct = LoanLossProv_pct*100,
+         NonPerfLoans_pct = NonPerfLoans_pct*100,
+         LongTermDebt_pct = LongTermDebt_pct*100,
+         LtD = LtD*100,
+         LeverageRatio = LeverageRatio*100,
+         TA_1 = if_else(TA < quantile(TA, 0.2), 1, 0),
+         TA_2 = if_else(TA < quantile(TA, 0.4) & TA >= quantile(TA, 0.2), 1, 0),
+         TA_3 = if_else(TA < quantile(TA, 0.6) & TA >= quantile(TA, 0.4), 1, 0),
+         TA_4 = if_else(TA < quantile(TA, 0.8) & TA >= quantile(TA, 0.6), 1, 0),
+         TA_5 = if_else(TA < quantile(TA, 1) & TA >= quantile(TA, 0.8), 1, 0))
+
+data_stata_win_reg_large <- data_stata_win_reg %>%
+  filter(TA_large == 1)
+data_stata_win_reg_small <- data_stata_win_reg %>%
+  filter(TA_large == 0)
+
+data_stata_win_reg_pre <- data_stata_win_reg %>%
+  filter(Year < 2015)
+data_stata_win_reg_post <- data_stata_win_reg %>%
+  filter(Year > 2014)
+
+data_stata_win_reg  <- pdata.frame(data_stata_win_reg, index = c("id", "Year"))
+data_stata_win_reg_large  <- pdata.frame(data_stata_win_reg_large, index = c("id", "Year"))
+data_stata_win_reg_small  <- pdata.frame(data_stata_win_reg_small, index = c("id", "Year"))
+data_stata_win_reg_pre  <- pdata.frame(data_stata_win_reg_pre, index = c("id", "Year"))
+data_stata_win_reg_post  <- pdata.frame(data_stata_win_reg_post, index = c("id", "Year"))
+
+
+data_stata_win_sub <- data_stata_win_reg %>%
+  select(-id:-Year, -T1LeverageRatio, -not_ComBank:-Outlier_neg)
+
+## non winsorised
+
+data_stata_reg <- data_stata %>%
+  mutate(TA = log(TA),
+         LoanstoTA = LoanstoTA*100,
+         NonIntInc_pct = NonIntInc_pct*100,
+         T1LeverageRatio = T1LeverageRatio*100,
+         LoanLossProv_pct = LoanLossProv_pct*100,
+         NonPerfLoans_pct = NonPerfLoans_pct*100,
+         LongTermDebt_pct = LongTermDebt_pct*100,
+         LtD = LtD*100,
+         LeverageRatio = LeverageRatio*100,
+         TA_1 = if_else(TA < quantile(TA, 0.2), 1, 0),
+         TA_2 = if_else(TA < quantile(TA, 0.4) & TA >= quantile(TA, 0.2), 1, 0),
+         TA_3 = if_else(TA < quantile(TA, 0.6) & TA >= quantile(TA, 0.4), 1, 0),
+         TA_4 = if_else(TA < quantile(TA, 0.8) & TA >= quantile(TA, 0.6), 1, 0),
+         TA_5 = if_else(TA < quantile(TA, 1) & TA >= quantile(TA, 0.8), 1, 0))
+data_stata_reg  <- pdata.frame(data_stata_reg, index = c("id", "Year"))
+
+
+
+#### Residual/winsorization/outlier examination ####
+
+residual_outlier <- residual %>%
+  filter(pos_outlier == 1 | neg_outlier == 1)
+
+residual_win_roe <- residual %>%
+  filter(roe > quantile(roe, 0.99) | roe < quantile(roe, 0.01))
+
+
+residual_win <- residual %>%
+  filter(roe > quantile(roe, 0.99) | roe < quantile(roe, 0.01) | roa > quantile(roa, 0.99) | roa < quantile(roa, 0.01) | ltd > quantile(ltd, 0.99) | ltd < quantile(ltd, 0.01) | loanstota > quantile(loanstota, 0.99) | loanstota < quantile(loanstota, 0.01) | leverageratio > quantile(leverageratio, 0.99) | leverageratio < quantile(leverageratio, 0.01) | t1_pct > quantile(t1_pct, 0.99, na.rm = TRUE) | t1_pct < quantile(t1_pct, 0.01, na.rm = TRUE) |        loanlossprov_pct > quantile(loanlossprov_pct, 0.99) | loanlossprov_pct < quantile(loanlossprov_pct, 0.01) | longtermdebt_pct > quantile(longtermdebt_pct, 0.99) | longtermdebt_pct < quantile(longtermdebt_pct, 0.01) |       efficiency > quantile(efficiency, 0.99) | efficiency < quantile(efficiency, 0.01) | 
+          nonintinc_pct > quantile(nonintinc_pct, 0.99) | nonintinc_pct < quantile(nonintinc_pct, 0.01))
+
+
+residual_win_reg  <- pdata.frame(residual_win, index = c("id", "year"))
+
+#### Z-scores ####
+
+data_stata_z <- data_stata %>%
+  mutate(TA = log(TA),
+         LtD = (LtD - mean(LtD))/sd(LtD),
+         TA = (TA - mean(TA))/sd(TA),
+         RoE = (RoE - mean(RoE))/sd(RoE),
+         RoA = (RoA - mean(RoA))/sd(RoA),
+         NonIntInc_pct = (NonIntInc_pct - mean(NonIntInc_pct))/sd(NonIntInc_pct),
+         Efficiency = (Efficiency - mean(Efficiency))/sd(Efficiency),
+         LeverageRatio = (LeverageRatio - mean(LeverageRatio))/sd(LeverageRatio),
+         T1_pct = (T1_pct - mean(T1_pct, na.rm = TRUE))/sd(T1_pct, na.rm = TRUE),
+         T1LeverageRatio = (T1LeverageRatio - mean(T1LeverageRatio, na.rm = TRUE))/sd(T1LeverageRatio, na.rm = TRUE),
+         LoanLossProv_pct = (LoanLossProv_pct - mean(LoanLossProv_pct))/sd(LoanLossProv_pct),
+         LongTermDebt_pct = (LongTermDebt_pct - mean(LongTermDebt_pct))/sd(LongTermDebt_pct),
+         LoanstoTA = (LoanstoTA - mean(LoanstoTA))/sd(LoanstoTA),
+         NonPerfLoans_pct = (NonPerfLoans_pct - mean(NonPerfLoans_pct, na.rm = TRUE))/sd(NonPerfLoans_pct, na.rm = TRUE),
+         GDP_pct = (GDP_pct - mean(GDP_pct))/sd(GDP_pct),
+         Inflation = (Inflation - mean(Inflation))/sd(Inflation),
+         est_RW = (est_RW - mean(est_RW, na.rm = TRUE))/sd(est_RW, na.rm = TRUE))  %>%
+  mutate(RoE_1 = if_else(RoE <= quantile(RoE, 0.25), 1, 0),
+         RoE_2 = if_else(RoE > quantile(RoE, 0.25) & RoE <= quantile(RoE, 0.50), 1, 0),
+         RoE_3 = if_else(RoE > quantile(RoE, 0.50) & RoE <= quantile(RoE, 0.75), 1, 0),
+         RoE_4 = if_else(RoE > quantile(RoE, 0.75) & RoE <= quantile(RoE, 1), 1, 0),
+         RoE_quartiles = if_else(RoE <= quantile(RoE, 0.25), 1, if_else(RoE <= quantile(RoE, 0.50), 2, if_else(RoE <= quantile(RoE, 0.75), 3, if_else(RoE <= quantile(RoE, 1), 4, 0)))),
+         RoE_top_10 = if_else(RoE > quantile(RoE, 0.90), 1, 0),
+         RoE_bottom_10 = if_else(RoE < quantile(RoE, 0.1), 1, 0),
+         RoE_top_50 = if_else(RoE > quantile(RoE, 0.5), 1, 0))
+
+data_stata_sum <- data_stata %>%
+  mutate(TA = log(TA)) %>%
+  gather(key = "variable", value = "value", TA:GDP_pct, est_RW) %>%
+  group_by(variable) %>%
+  summarise(mean = mean(value, na.rm = TRUE),
+            sd = sd(value, na.rm = TRUE))
+
+# alternative winsorisation -> cap all z-score at eg 3 and transform back. 
+
+data_stata_z_gather <- data_stata_z %>%
+  gather(key = "variable", value = "value", RoE:GDP_pct, est_RW) %>%
+  mutate(value = if_else(value > 3, 3, value),
+         value = if_else(value < -3, -3, value)) %>%
+  spread(key = variable, value = value) %>%
+  gather(key = "variable", value = "value", T1_pct, TA, Efficiency:RoE)
+
+data_stata_z <- data_stata_z_gather %>%
+  spread(key = variable, value = value) 
+
+data_stata_z_win <- data_stata_z %>%
+  gather(key = "variable", value = "value", TA, Efficiency:T1LeverageRatio, est_RW) %>%
+  left_join(data_stata_sum, by = "variable") %>%
+  mutate(value = mean + (value*sd)) %>%
+  select(-mean, -sd) %>%
+  spread(key = variable, value = value) %>%
+  select(id:Year, RoE, RoA, TA, Efficiency, LeverageRatio:NonPerfLoans_pct, T1_pct:T1LeverageRatio, GDP_pct:Inflation, est_RW, not_ComBank:TA_small)
+  
+
+#write.csv(data_stata_z_win, "data_short7_z_win.csv", row.names = FALSE)
+
+
+data_stata_z_win_reg <- data_stata_z_win %>%
+  mutate(LoanstoTA = LoanstoTA*100,
+         NonIntInc_pct = NonIntInc_pct*100,
+         T1LeverageRatio = T1LeverageRatio*100,
+         LoanLossProv_pct = LoanLossProv_pct*100,
+         NonPerfLoans_pct = NonPerfLoans_pct*100,
+         LongTermDebt_pct = LongTermDebt_pct*100,
+         LtD = LtD*100,
+         LeverageRatio = LeverageRatio*100,
+         TA_1 = if_else(TA < quantile(TA, 0.2), 1, 0),
+         TA_2 = if_else(TA < quantile(TA, 0.4) & TA >= quantile(TA, 0.2), 1, 0),
+         TA_3 = if_else(TA < quantile(TA, 0.6) & TA >= quantile(TA, 0.4), 1, 0),
+         TA_4 = if_else(TA < quantile(TA, 0.8) & TA >= quantile(TA, 0.6), 1, 0),
+         TA_5 = if_else(TA < quantile(TA, 1) & TA >= quantile(TA, 0.8), 1, 0))
+data_stata_z_win_reg  <- pdata.frame(data_stata_z_win_reg, index = c("id", "Year"))
+
+
+
+#### Z-scores, by year ####
+
+data_stata_z_year <- data_stata %>%
+  group_by(Year) %>%
+  mutate(TA = log(TA),
+         LtD = (LtD - mean(LtD))/sd(LtD),
+         TA = (TA - mean(TA))/sd(TA),
+         RoE = (RoE - mean(RoE))/sd(RoE),
+         RoA = (RoA - mean(RoA))/sd(RoA),
+         NonIntInc_pct = (NonIntInc_pct - mean(NonIntInc_pct))/sd(NonIntInc_pct),
+         Efficiency = (Efficiency - mean(Efficiency))/sd(Efficiency),
+         LeverageRatio = (LeverageRatio - mean(LeverageRatio))/sd(LeverageRatio),
+         T1_pct = (T1_pct - mean(T1_pct, na.rm = TRUE))/sd(T1_pct, na.rm = TRUE),
+         T1LeverageRatio = (T1LeverageRatio - mean(T1LeverageRatio, na.rm = TRUE))/sd(T1LeverageRatio, na.rm = TRUE),
+         LoanLossProv_pct = (LoanLossProv_pct - mean(LoanLossProv_pct))/sd(LoanLossProv_pct),
+         LongTermDebt_pct = (LongTermDebt_pct - mean(LongTermDebt_pct))/sd(LongTermDebt_pct),
+         LoanstoTA = (LoanstoTA - mean(LoanstoTA))/sd(LoanstoTA),
+         NonPerfLoans_pct = (NonPerfLoans_pct - mean(NonPerfLoans_pct, na.rm = TRUE))/sd(NonPerfLoans_pct, na.rm = TRUE),
+         est_RW = (est_RW - mean(est_RW, na.rm = TRUE))/sd(est_RW, na.rm = TRUE)) %>%
+  ungroup()
+
+data_stata_sum_year <- data_stata %>%
+  mutate(TA = log(TA)) %>%
+  gather(key = "variable", value = "value", TA:LongTermDebt_pct, est_RW) %>%
+  group_by(variable, Year) %>%
+  summarise(mean = mean(value, na.rm = TRUE),
+            sd = sd(value, na.rm = TRUE)) %>%
+  ungroup()
+
+# alternative winsorisation -> cap all z-score at eg 3 and transform back. 
+
+data_stata_z_year_win <- data_stata_z_year %>%
+  gather(key = "variable", value = "value", RoE:LongTermDebt_pct, est_RW) %>%
+  mutate(win = if_else(value > 3, 1, 0),
+         win = if_else(value < -3, 1, win),
+         win = if_else(is.na(win) == TRUE, 0, win),
+         value = if_else(value > 3, 3, value),
+         value = if_else(value < -3, -3, value)) %>%
+  select(-win) %>%
+  spread(key = variable, value = value) %>%
+  gather(key = "variable", value = "value", TA, Efficiency:T1LeverageRatio) %>%
+  left_join(data_stata_sum_year, by = c("variable", "Year")) %>%
+  mutate(value = mean + (value*sd)) %>%
+  select(-mean, -sd) %>%
+  spread(key = variable, value = value) %>%
+  select(id:Year, RoE, RoA, TA, Efficiency, LeverageRatio:NonPerfLoans_pct, T1_pct:T1LeverageRatio, GDP_pct:Inflation, est_RW, not_ComBank:TA_small) %>%
+  ungroup()
+  
+
+#write.csv(data_stata_z_year_win, "data_short8_z_year_win.csv", row.names = FALSE)
+
+data_stata_z_year_win_reg <- data_stata_z_year_win %>%
+  mutate(LoanstoTA = LoanstoTA*100,
+         NonIntInc_pct = NonIntInc_pct*100,
+         T1LeverageRatio = T1LeverageRatio*100,
+         LoanLossProv_pct = LoanLossProv_pct*100,
+         NonPerfLoans_pct = NonPerfLoans_pct*100,
+         LongTermDebt_pct = LongTermDebt_pct*100,
+         LtD = LtD*100,
+         LeverageRatio = LeverageRatio*100,
+         TA_1 = if_else(TA < quantile(TA, 0.2), 1, 0),
+         TA_2 = if_else(TA < quantile(TA, 0.4) & TA >= quantile(TA, 0.2), 1, 0),
+         TA_3 = if_else(TA < quantile(TA, 0.6) & TA >= quantile(TA, 0.4), 1, 0),
+         TA_4 = if_else(TA < quantile(TA, 0.8) & TA >= quantile(TA, 0.6), 1, 0),
+         TA_5 = if_else(TA < quantile(TA, 1) & TA >= quantile(TA, 0.8), 1, 0))
+
+data_stata_z_year_win_reg  <- pdata.frame(data_stata_z_year_win_reg, index = c("id", "Year"))
+
+```
+
+# Summary Stats
+
+```{r}
+summary(data_short)
+
+```
+
+```{r}
+describe(data_short %>% select(-1, -2, -3))
+
+```
+
+```{r}
+stargazer(data_short %>% mutate(TA = log(TA)))
+
+```
+
+## Winsorised summary statistics
+
+
+```{r}
+data_stata_win_summary <- data_stata_win_reg %>%
+  gather(key = "Variable", value = "Value", TA:LeverageRatio, T1_pct:GDP_pct) %>%
+  filter(is.na(Value) != TRUE) %>%
+  group_by(Variable) %>%
+  summarise(N = n(),
+            Mean = round(mean(Value, na.rm = TRUE),2),
+            'St. Dev.' = round(sd(Value, na.rm = TRUE),2),
+            Min = round(min(Value, na.rm = TRUE),2),
+            'Pctl(25)' = round(quantile(Value, 0.25, na.rm = TRUE),2),
+            Median = round(quantile(Value, 0.50, na.rm = TRUE),2),
+            'Pctl(75)' = round(quantile(Value, 0.75, na.rm = TRUE),2),
+            Max = round(max(Value, na.rm = TRUE),2)) 
+
+rownames(data_stata_win_summary) <- data_stata_win_summary$Variable
+
+data_stata_win_summary <- data_stata_win_summary %>%
+  select(-Variable)
+
+stargazer(data_stata_win_summary, summary = FALSE)
+
+```
+
+With est_RW
+
+```{r}
+data_stata_win_summary <- data_stata_win_reg %>%
+  gather(key = "Variable", value = "Value", TA:LeverageRatio, T1_pct:GDP_pct, est_RW) %>%
+  filter(is.na(Value) != TRUE) %>%
+  group_by(Variable) %>%
+  summarise(N = n(),
+            Mean = round(mean(Value, na.rm = TRUE),2),
+            'St. Dev.' = round(sd(Value, na.rm = TRUE),2),
+            Min = round(min(Value, na.rm = TRUE),2),
+            'Pctl(25)' = round(quantile(Value, 0.25, na.rm = TRUE),2),
+            Median = round(quantile(Value, 0.50, na.rm = TRUE),2),
+            'Pctl(75)' = round(quantile(Value, 0.75, na.rm = TRUE),2),
+            Max = round(max(Value, na.rm = TRUE),2)) 
+
+rownames(data_stata_win_summary) <- data_stata_win_summary$Variable
+
+data_stata_win_summary <- data_stata_win_summary %>%
+  select(-Variable)
+
+stargazer(data_stata_win_summary, summary = FALSE)
+
+```
+
+# RoE over years
+
+Data from St.Louise FED
+
+```{r}
+#ggplotly(
+#p1 <- 
+fredgraph %>%
+  ggplot(aes(x = Date, y = RoE)) +
+  #geom_rect(mapping = aes(xmin=as.Date("01/01/2010", format = "%d/%m/%Y"), xmax=as.Date("01/10/2018", format = "%d/%m/%Y"), ymin=-Inf, ymax=Inf), fill = "grey95") +
+  theme_bw() +
+  theme(panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank(),
+        plot.background = element_rect(fill = "lightblue"),
+        panel.background = element_rect(fill = "white", colour = "grey50")) +
+  geom_line(size = 1, col = "darkblue") +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y",
+               minor_breaks = function(x) seq.Date(from = min(x), 
+   											  to = max(x), 
+   											  by = "5 years"),
+               expand = c(0,0)) +
+  scale_y_continuous(limits = c(-10, 20), breaks = seq(-10, 20, 5), minor_breaks = seq(-10, 20, 5)) +
+  geom_vline(xintercept = as.Date("01/01/2010", format = "%d/%m/%Y"), linetype = "dashed") +
+  geom_vline(xintercept = as.Date("01/10/2018", format = "%d/%m/%Y"), linetype = "dashed") +
+  theme(axis.ticks = element_line(colour = "black"),
+        axis.text = element_text(size = 14),
+        axis.title.y = element_text(size = 16),
+        title = element_text(size = 20)) +
+  labs(title = "Return on Average Equity for all U.S. Banks", x = "Year")
+#)
+
+
+#png(filename="C:/Users/phili/OneDrive/UNI/3rd Year/ES30029/Determinants of bank profitability/Data/RoE_chart.png",
+#    type="cairo",
+#    units="in", 
+#    width=12, 
+#    height=8, 
+#    pointsize=20, 
+#    res=300)
+#print(p1)
+#dev.off()
+
+```
+
+Return on Average Assets for all U.S. Banks
+
+
+
+
+```{r}
+#ggplotly(
+#p2 <- 
+fredgraph %>%
+  ggplot(aes(x = Date, y = RoA)) +
+  #geom_rect(mapping = aes(xmin=as.Date("01/01/2010", format = "%d/%m/%Y"), xmax=as.Date("01/10/2018", format = "%d/%m/%Y"), ymin=-Inf, ymax=Inf), fill = "grey95") +
+  theme_bw() +
+  theme(panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank(),
+        plot.background = element_rect(fill = "lightblue"),
+        panel.background = element_rect(fill = "white", colour = "grey50")) +
+  geom_line(size = 1, col = "darkred") +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y",
+               minor_breaks = function(x) seq.Date(from = min(x), 
+   											  to = max(x), 
+   											  by = "5 years"),
+               expand = c(0,0)) +
+  scale_y_continuous(limits = c(-1, 2), breaks = seq(-1, 2, 0.5), minor_breaks = seq(-1, 2, 0.5)) +
+  geom_vline(xintercept = as.Date("01/01/2010", format = "%d/%m/%Y"), linetype = "dashed") +
+  geom_vline(xintercept = as.Date("01/10/2018", format = "%d/%m/%Y"), linetype = "dashed") +
+  theme(axis.ticks = element_line(colour = "black"),
+        axis.text = element_text(size = 14),
+        axis.title.y = element_text(size = 16),
+        title = element_text(size = 20)) +
+  labs(title = "Return on Average Assets for all U.S. Banks", x = "Year")
+#)
+
+
+#png(filename="C:/Users/phili/OneDrive/UNI/3rd Year/ES30029/Determinants of bank profitability/Data/RoA_chart.png",
+#    type="cairo",
+#    units="in", 
+#    width=12, 
+#    height=8, 
+#    pointsize=20, 
+#    res=300)
+#print(p2)
+#dev.off()
+#)
+```
+
+### together, not used
+
+```{r}
+#ggplotly(
+fredgraph %>%
+  ggplot(aes(x = Date)) +
+  #geom_rect(mapping = aes(xmin=as.Date("01/01/2010", format = "%d/%m/%Y"), xmax=as.Date("01/10/2018", format = "%d/%m/%Y"), ymin=-Inf, ymax=Inf), fill = "grey95") +
+  theme_minimal() +
+  theme(panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank(),
+        plot.background = element_rect(fill = "lightblue"),
+        panel.background = element_rect(fill = "white", colour = "grey50")) +
+  geom_line(aes(y = RoE), size = 1.1, col = "darkblue") +
+  geom_line(aes(y = RoA*10), size = 1.1, col = "darkred") +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y",
+               minor_breaks = function(x) seq.Date(from = min(x), 
+   											  to = max(x), 
+   											  by = "5 years"),
+               expand = c(0,0)) +
+  scale_y_continuous(limits = c(-10, 20), breaks = seq(-10, 20, 5), minor_breaks = seq(-10, 20, 5),
+                     sec.axis = sec_axis(~./10, name = "RoA")) +
+  geom_vline(xintercept = as.Date("01/01/2010", format = "%d/%m/%Y"), linetype = "dashed") +
+  geom_vline(xintercept = as.Date("01/10/2018", format = "%d/%m/%Y"), linetype = "dashed") +
+  theme(axis.title.x = element_blank(),
+        axis.ticks = element_line(colour = "black")) +
+  labs(title = "Return on Average Equity for all U.S. Banks", 
+       caption = "
+       Source: Federal Financial Institutions Examination Council (US)")
+#)
+```
+
+##
+
+Net Interest Margin for all U.S. Banks
+
+
+
+```{r}
+#ggplotly(
+#p3 <- 
+fredgraph %>%
+  ggplot(aes(x = Date, y = USNIM)) +
+  #geom_rect(mapping = aes(xmin=as.Date("01/01/2010", format = "%d/%m/%Y"), xmax=as.Date("01/10/2018", format = "%d/%m/%Y"), ymin=-Inf, ymax=Inf), fill = "grey95") +
+  theme_bw() +
+  theme(panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank(),
+        plot.background = element_rect(fill = "lightblue"),
+        panel.background = element_rect(fill = "white", colour = "grey50")) +
+  geom_line(size = 1, col = "darkgreen") +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y",
+               minor_breaks = function(x) seq.Date(from = min(x), 
+   											  to = max(x), 
+   											  by = "5 years"),
+               expand = c(0,0)) +
+  scale_y_continuous(limits = c(2.5, 6), breaks = seq(2.5, 6, 0.5), minor_breaks = seq(2.5, 6, 0.5)) +
+  geom_vline(xintercept = as.Date("01/01/2010", format = "%d/%m/%Y"), linetype = "dashed") +
+  geom_vline(xintercept = as.Date("01/10/2018", format = "%d/%m/%Y"), linetype = "dashed") +
+  theme(axis.ticks = element_line(colour = "black"),
+        axis.text = element_text(size = 14),
+        axis.title.y = element_text(size = 16),
+        title = element_text(size = 20)) +
+  labs(title = "Net Interest Margin for all U.S. Banks", x = "Year", y = "Net Interest Margin (%)")
+#)
+
+
+#png(filename="C:/Users/phili/OneDrive/UNI/3rd Year/ES30029/Determinants of bank profitability/Data/NIM_chart.png",
+#    type="cairo",
+#    units="in", 
+#    width=12, 
+#    height=8, 
+#    pointsize=20, 
+#    res=300)
+#print(p3)
+#dev.off()
+
+```
+
+Effective Federal Funds Rate
+
+
+
+
+
+```{r}
+#ggplotly(
+#p4 <- 
+FEDFUNDS %>%
+  ggplot(aes(x = Date, y = FEDFUNDS)) +
+  #geom_rect(mapping = aes(xmin=as.Date("01/01/2010", format = "%d/%m/%Y"), xmax=as.Date("01/10/2018", format = "%d/%m/%Y"), ymin=-Inf, ymax=Inf), fill = "grey95") +
+  theme_bw() +
+  theme(panel.grid.major.x = element_blank(), panel.grid.minor.x = element_blank(),
+        plot.background = element_rect(fill = "lightblue"),
+        panel.background = element_rect(fill = "white", colour = "grey50")) +
+  geom_line(size = 1, col = "orange") +
+  scale_x_date(date_breaks = "5 years", date_labels = "%Y",
+               minor_breaks = function(x) seq.Date(from = min(x), 
+   											  to = max(x), 
+   											  by = "5 years"),
+               expand = c(0,0)) +
+  scale_y_continuous(limits = c(0, 12), breaks = seq(0, 12, 1), minor_breaks = seq(0, 12, 1)) +
+  geom_vline(xintercept = as.Date("01/01/2010", format = "%d/%m/%Y"), linetype = "dashed") +
+  geom_vline(xintercept = as.Date("01/10/2018", format = "%d/%m/%Y"), linetype = "dashed") +
+  theme(axis.ticks = element_line(colour = "black"),
+        axis.text = element_text(size = 14),
+        axis.title.y = element_text(size = 16),
+        title = element_text(size = 20)) +
+  labs(title = "Effective Federal Funds Rate", x = "Year", y = "Effective Federal Funds Rate (%)")
+#)
+
+
+#png(filename="C:/Users/phili/OneDrive/UNI/3rd Year/ES30029/Determinants of bank profitability/Data/Rate_chart.png",
+#    type="cairo",
+#    units="in", 
+#    width=12, 
+#    height=8, 
+#    pointsize=20, 
+#    res=300)
+#print(p4)
+#dev.off()
+```
+
+# Correlation Matrix 
+
+## Variables of interest
+
+Just 2018
+
+```{r}
+corrplot(cor_select, order = "hclust", 
+         tl.col = "black", tl.srt = 45)
+```
+
+## Variables used in regression 
+
+Just 2018
+
+```{r}
+corrplot(cor_stata_win, order = "hclust", 
+         tl.col = "black", tl.srt = 45)
+```
+
+### All years, winsorised sample
+
+```{r}
+corrplot(cor_stata_win, order = "hclust", 
+         tl.col = "black", tl.srt = 45)
+```
+
+```{r}
+cor_stata_win_diag <- cor_stata_win
+
+rownames(cor_stata_win_diag) <- c("Size - ln(TA)", "RoE", "RoA", "Loans to Deposits", "Loans to Total Assets", "Diversification", "Efficiency", "Leverage Ratio", "Risk-Weighted Capital", "Loan Loss Provisions", "Non-Performing Loans", "Long-Term Debt", "Average Risk-Weight")
+colnames(cor_stata_win_diag) <- c("Size - ln(TA)", "RoE", "RoA", "Loans to Deposits", "Loans to Total Assets", "Diversification", "Efficiency", "Leverage Ratio", "Risk-Weighted Capital", "Loan Loss Provisions", "Non-Performing Loans", "Long-Term Debt", "Average Risk-Weight")
+diag(cor_stata_win_diag) = NA
+
+corrplot(cor_stata_win_diag, order = "hclust", 
+         tl.col = "black", tl.srt = 45,
+         method = "color", na.label = "-",
+         p.mat = rcor_stata_win$P,
+         insig = "label_sig", sig.level = c(.001, .01, .05), pch.cex = .8, pch.col = "black")
+```
+
+
+### Of first differences
+
+
+```{r}
+cor_stata_changes_diag <- cor_stata_changes
+rownames(cor_stata_changes_diag) <- c("Size - ln(TA)", "RoE", "RoA", "Loans to Deposits", "Loans to Total Assets", "Diversification", "Efficiency", "Leverage Ratio", "Risk-Weighted Capital", "Loan Loss Provisions", "Non-Performing Loans", "Long-Term Debt", "Average Risk-Weight")
+colnames(cor_stata_changes_diag) <- c("Size - ln(TA)", "RoE", "RoA", "Loans to Deposits", "Loans to Total Assets", "Diversification", "Efficiency", "Leverage Ratio", "Risk-Weighted Capital", "Loan Loss Provisions", "Non-Performing Loans", "Long-Term Debt", "Average Risk-Weight")
+diag(cor_stata_changes_diag) = NA
+
+corrplot(cor_stata_changes_diag, order = "hclust", 
+         tl.col = "black", tl.srt = 45,
+         method = "color", na.label = "-",
+         p.mat = rcor_stata_changes$P,
+         insig = "label_sig", sig.level = c(.001, .01, .05), pch.cex = .8, pch.col = "black")
+```
+
+### Average of each year's correlation
+
+```{r}
+corrplot(cor_stata_win_year, order = "hclust", 
+         tl.col = "black", tl.srt = 45)
+```
+
+
+```{r}
+cor_stata_win_year_diag <- cor_stata_win_year
+diag(cor_stata_win_year_diag) = NA
+
+corrplot(cor_stata_win_year_diag, order = "hclust",
+         tl.col = "black", tl.srt = 45,
+         method = "color", na.label = "-")
+```
+
+## Correlation over time 
+
+### ROE
+
+```{r}
+cor_stata_win_year_DF %>%
+  ggplot(aes(x = Year, y = RoE, colour = Variable, group = Variable)) + 
+  geom_line(size = 1) +
+  scale_x_continuous(expand = c(0.15, 0.15), breaks = seq(2010, 2018, 2)
+                     ) +
+  geom_dl(aes(label = Variable), method = list(dl.combine("first.points", "last.points"), cex = 0.6)) +
+  labs(y = "Correlation with RoE")
+```
+
+### ROA
+
+```{r}
+cor_stata_win_year_DF %>%
+  ggplot(aes(x = Year, y = RoA, colour = Variable, group = Variable)) + 
+  geom_line(size = 1) +
+  scale_x_continuous(expand = c(0.15, 0.15), breaks = seq(2010, 2018, 2)
+                     ) +
+  geom_dl(aes(label = Variable), method = list(dl.combine("first.points", "last.points"), cex = 0.6)) +
+  labs(y = "Correlation with RoE")
+```
+
+### TA
+
+```{r}
+cor_stata_win_year_DF %>%
+  ggplot(aes(x = Year, y = TA, colour = Variable, group = Variable)) + 
+  geom_line(size = 1) +
+  scale_x_continuous(expand = c(0.15, 0.15), breaks = seq(2010, 2018, 2)
+                     ) +
+  geom_dl(aes(label = Variable), method = list(dl.combine("first.points", "last.points"), cex = 0.6)) +
+  labs(y = "Correlation with RoE")
+```
+
+### T1_pct
+
+```{r}
+cor_stata_win_year_DF %>%
+  ggplot(aes(x = Year, y = T1_pct, colour = Variable, group = Variable)) + 
+  geom_line(size = 1) +
+  scale_x_continuous(expand = c(0.15, 0.15), breaks = seq(2010, 2018, 2)
+                     ) +
+  geom_dl(aes(label = Variable), method = list(dl.combine("first.points", "last.points"), cex = 0.6)) +
+  labs(y = "Correlation with RoE")
+```
+
+### Loan Loss Provision
+
+```{r}
+cor_stata_win_year_DF %>%
+  ggplot(aes(x = Year, y = LoanLossProv_pct, colour = Variable, group = Variable)) + 
+  geom_line(size = 1) +
+  scale_x_continuous(expand = c(0.15, 0.15), breaks = seq(2010, 2018, 2)
+                     ) +
+  geom_dl(aes(label = Variable), method = list(dl.combine("first.points", "last.points"), cex = 0.6)) +
+  labs(y = "Correlation with RoE")
+```
+
+### Z-score over time
+
+```{r}
+data_stata_z %>%
+  gather(key = "variable", value = "value", TA:LeverageRatio, T1_pct:GDP_pct, est_RW) %>%
+  group_by(Year, variable) %>%
+  summarise(value = mean(value, na.rm = TRUE)) %>%
+  filter(variable != "Inflation" & variable != "GDP_pct") %>%
+  ggplot(aes(x = Year, y = value, colour = variable, group = variable)) + 
+  geom_line(size = 0.9) +
+  scale_x_continuous(expand = c(0.15, 0.15), breaks = seq(2010, 2018, 2)) +
+  geom_dl(aes(label = variable), method = list(dl.combine("first.points", "last.points"), cex = 0.6)) +
+  labs(y = "Z-Score")
+```
+
+### Variable over time (free scale facet)
+
+```{r}
+data_stata_win %>%
+  mutate(TA = log(TA),
+         LoanstoTA = LoanstoTA*100,
+         NonIntInc_pct = NonIntInc_pct*100,
+         T1LeverageRatio = T1LeverageRatio*100,
+         LoanLossProv_pct = LoanLossProv_pct*100,
+         NonPerfLoans_pct = NonPerfLoans_pct*100,
+         LongTermDebt_pct = LongTermDebt_pct*100,
+         LtD = LtD*100,
+         LeverageRatio = LeverageRatio*100) %>%
+  gather(key = "variable", value = "value", TA:LeverageRatio, T1_pct:GDP_pct) %>%
+  group_by(Year, variable) %>%
+  summarise(mean = mean(value, na.rm = TRUE)) %>%
+  filter(variable != "Inflation" & variable != "GDP_pct") %>%
+  mutate(variable = as.factor(variable),
+         variable = factor(variable, levels(variable)[c(10, 9, 12, 1, 7, 2, 11, 3, 8, 6, 4, 5)],
+                           labels = c("RoE", "RoA", "ln(TA)", "Efficiency", "Non-interest income", "Leverage Ratio", "T1 (% RWAs)", "Loan Loss Provisions", "Non-performing Loans", "Loans to Deposits", "Loans to Total Assets", "Long-term Debt"))) %>%
+  ggplot(aes(x = Year, y = mean, colour = variable, group = variable)) + 
+  geom_line(size = 0.9) +
+  scale_x_continuous(breaks = seq(2010, 2018, 4)) +
+  facet_wrap(~ variable, scales = "free") +
+  theme(legend.position = "none",
+        axis.title.x = element_blank()) +
+  labs(title = "Change in mean value for each variable over time", y = "mean 
+       ")
+
+```
+
+```{r}
+data_stata_win %>%
+  mutate(TA = log(TA),
+         LoanstoTA = LoanstoTA*100,
+         NonIntInc_pct = NonIntInc_pct*100,
+         T1LeverageRatio = T1LeverageRatio*100,
+         LoanLossProv_pct = LoanLossProv_pct*100,
+         NonPerfLoans_pct = NonPerfLoans_pct*100,
+         LongTermDebt_pct = LongTermDebt_pct*100,
+         LtD = LtD*100,
+         LeverageRatio = LeverageRatio*100) %>%
+  gather(key = "variable", value = "value", TA:LeverageRatio, T1_pct:GDP_pct) %>%
+  group_by(Year, variable) %>%
+  summarise(median = median(value, na.rm = TRUE),
+            first = quantile(value, 0.25, na.rm = TRUE),
+            third = quantile(value, 0.75, na.rm = TRUE)) %>%
+  filter(variable != "Inflation" & variable != "GDP_pct") %>%
+  mutate(variable = as.factor(variable),
+         variable = factor(variable, levels(variable)[c(10, 9, 12, 1, 7, 2, 11, 3, 8, 6, 4, 5)],
+                           labels = c("RoE", "RoA", "ln(TA)", "Efficiency", "Non-interest income", "Leverage Ratio", "T1 (% RWAs)", "Loan Loss Provisions", "Non-performing Loans", "Loans to Deposits", "Loans to Total Assets", "Long-term Debt"))) %>%
+  ggplot(aes(x = Year, y = median, colour = variable, group = variable)) + 
+  geom_line(size = 0.9) +
+  geom_line(aes(y = first), alpha = 0.3, size = 0.9) +
+  geom_line(aes(y = third), alpha = 0.3, size = 0.9) +
+  scale_x_continuous(breaks = seq(2010, 2018, 4)) +
+  facet_wrap(~ variable, scales = "free") +
+  theme(legend.position = "none",
+        axis.title.x = element_blank()) +
+  labs(title = "Change in median and IQR for each variable over time", y = "Median and IQR 
+       ")
+
+```
+
+
+
+```{r}
+data_stata_win %>%
+  mutate(TA = log(TA),
+         LoanstoTA = LoanstoTA*100,
+         NonIntInc_pct = NonIntInc_pct*100,
+         T1LeverageRatio = T1LeverageRatio*100,
+         LoanLossProv_pct = LoanLossProv_pct*100,
+         NonPerfLoans_pct = NonPerfLoans_pct*100,
+         LongTermDebt_pct = LongTermDebt_pct*100,
+         LtD = LtD*100,
+         LeverageRatio = LeverageRatio*100) %>%
+  gather(key = "variable", value = "value", TA:LeverageRatio, T1_pct:GDP_pct) %>%
+  filter(variable != "Inflation" & variable != "GDP_pct") %>%
+  mutate(variable = as.factor(variable),
+         variable = factor(variable, levels(variable)[c(10, 9, 12, 1, 7, 2, 11, 3, 8, 6, 4, 5)],
+                           labels = c("RoE", "RoA", "ln(TA)", "Efficiency", "Non-interest income", "Leverage Ratio", "T1 (% RWAs)", "Loan Loss Provisions", "Non-performing Loans", "Loans to Deposits", "Loans to Total Assets", "Long-term Debt"))) %>%
+  ggplot(aes(x = Year, y = value, fill = variable, group = Year)) + 
+  geom_boxplot(outlier.colour = "grey") +
+  scale_x_continuous(breaks = seq(2010, 2018, 4)) +
+  facet_wrap(~ variable, scales = "free") +
+  theme(legend.position = "none",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+```
+
+New theme
+
+```{r}
+data_stata_win %>%
+  mutate(TA = log(TA),
+         LoanstoTA = LoanstoTA*100,
+         NonIntInc_pct = NonIntInc_pct*100,
+         T1LeverageRatio = T1LeverageRatio*100,
+         LoanLossProv_pct = LoanLossProv_pct*100,
+         NonPerfLoans_pct = NonPerfLoans_pct*100,
+         LongTermDebt_pct = LongTermDebt_pct*100,
+         LtD = LtD*100,
+         LeverageRatio = LeverageRatio*100) %>%
+  gather(key = "variable", value = "value", TA:LeverageRatio, T1_pct:LoanLossProv_pct, LongTermDebt_pct, est_RW) %>%
+  mutate(variable = as.factor(variable), 
+         variable = factor(variable, levels(variable)[c(10, 9, 12, 1, 8, 3, 11, 2, 4, 7, 5, 6)], 
+                           labels = c("RoE", "RoA", "Size - ln(TA)", "Efficiency", "Diversification", "Leverage Ratio", "Risk-Weighted Capital", "Average Risk-Weight", "Loan Loss Provisions", "Loans to Deposits", "Loans to Total Assets", "Long-Term Debt"))) %>%
+  ggplot(aes(x = Year, y = value, fill = variable, group = Year)) + 
+  geom_boxplot(outlier.colour = "grey") +
+  scale_x_continuous(breaks = seq(2010, 2018, 4)) +
+  facet_wrap(~ variable, scales = "free") +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.title.x = element_blank(), axis.title.y = element_blank(),
+        panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(), 
+        plot.background = element_rect(fill = "white"),
+        panel.background = element_rect(fill = "white", colour = "grey50"),
+        axis.ticks = element_line(colour = "black"))
+```
+
+# Box Plots
+
+## Dependent Variables
+
+### RoE
+```{r}
+data %>%
+  ggplot(aes(x = Year, y = RoE, group = Year)) +
+  geom_boxplot() +
+  scale_x_continuous(breaks = seq(2010, 2018, 1))
+
+```
+
+
+### RoA
+```{r}
+data %>%
+  ggplot(aes(x = Year, y = RoA, group = Year)) +
+  geom_boxplot() +
+  scale_x_continuous(breaks = seq(2010, 2018, 1))
+
+```
+
+## Independent Variables
+
+### Size (Total Assets - Log)
+```{r}
+data %>%
+  ggplot(aes(x = Year, y = TA, group = Year)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  scale_x_continuous(breaks = seq(2010, 2018, 1))
+
+```
+
+
+### Credit Quality (Loan Loss Provision as % of Loans)
+```{r}
+data %>%
+  ggplot(aes(x = Year, y = LoanLossProv_pct, group = Year)) +
+  geom_boxplot() +
+  scale_y_continuous(labels = percent_format()) +
+  scale_x_continuous(breaks = seq(2010, 2018, 1))
+
+```
+
+
+### Credit Quality (Non-performing loans as % of Loans) # some NAs
+```{r}
+data %>%
+  ggplot(aes(x = Year, y = NonPerfLoans_pct, group = Year)) +
+  geom_boxplot() +
+  scale_y_continuous(labels = percent_format()) +
+  scale_x_continuous(breaks = seq(2010, 2018, 1))
+
+```
+
+### Managment Efficiency (Cost of Revenue)
+```{r, warning=FALSE}
+data %>%
+  ggplot(aes(x = Year, y = Efficiency, group = Year)) +
+  geom_boxplot() +
+  scale_x_continuous(breaks = seq(2010, 2018, 1))
+
+```
+
+### Capitalisation (Tier 1 capital as % of Risk-weighted Assets)
+```{r, warning=FALSE}
+data %>%
+  ggplot(aes(x = Year, y = T1_pct, group = Year)) +
+  geom_boxplot() +
+  scale_x_continuous(breaks = seq(2010, 2018, 1))
+
+
+```
+
+### Capitalisation (Capital as % of Total Assets)
+```{r}
+data %>%
+  ggplot(aes(x = Year, y = LeverageRatio, group = Year)) +
+  geom_boxplot() +
+  scale_y_continuous(labels = percent_format()) +
+  scale_x_continuous(breaks = seq(2010, 2018, 1))
+
+
+```
+
+### Estimated Risk-Weight
+
+```{r}
+data_stata %>%
+  ggplot(aes(x = Year, y = est_RW, group = Year)) +
+  geom_boxplot() +
+  scale_x_continuous(breaks = seq(2010, 2018, 1))
+
+
+```
+
+### Diversification (% of Non-Interest Income)
+```{r}
+data %>%
+  ggplot(aes(x = Year, y = NonIntInc_pct, group = Year)) +
+  geom_boxplot() +
+  scale_y_continuous(labels = percent_format()) +
+  scale_x_continuous(breaks = seq(2010, 2018, 1))
+
+```
+
+
+### Liquidity proxy (Loans to Deposits)
+```{r}
+data %>%
+  ggplot(aes(x = Year, y = LtD, group = Year)) +
+  geom_boxplot() +
+  scale_x_continuous(breaks = seq(2010, 2018, 1))
+
+```
+
+
+### Financing (Long-term Debt as % of Total Assets)
+```{r}
+data %>%
+  ggplot(aes(x = Year, y = LongTermDebt_pct, group = Year)) +
+  geom_boxplot() +
+  scale_y_continuous(labels = percent_format()) +
+  scale_x_continuous(breaks = seq(2010, 2018, 1))
+
+
+```
+
+# Histograms
+
+## Dependent Variables
+
+### RoE
+
+
+```{r}
+data %>%
+  ggplot(aes(x = RoE)) +
+  geom_histogram(bins = 75) +
+  facet_wrap(~ Year) +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(mean.RoE = mean(RoE)), aes(xintercept = mean.RoE), linetype = "dashed", col = "red") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(st.RoE = quantile(RoE, 0.25)), aes(xintercept = st.RoE), linetype = "dashed", col = "orange") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(rd.RoE = quantile(RoE, 0.75)), aes(xintercept = rd.RoE), linetype = "dashed", col = "orange")
+
+```
+
+
+### RoA
+```{r}
+data %>%
+  ggplot(aes(x = RoA)) +
+  geom_histogram(bins = 75) +
+  facet_wrap(~ Year) +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(mean.RoA = mean(RoA)), aes(xintercept = mean.RoA), linetype = "dashed", col = "red") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(st.RoA = quantile(RoA, 0.25)), aes(xintercept = st.RoA), linetype = "dashed", col = "orange") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(rd.RoA = quantile(RoA, 0.75)), aes(xintercept = rd.RoA), linetype = "dashed", col = "orange")
+
+```
+
+## Independent Variables
+
+### Size (Total Assets - Log)
+```{r}
+data %>%
+  ggplot(aes(x = TA)) +
+  geom_histogram(bins = 75) +
+  scale_x_log10() +
+  facet_wrap(~ Year) +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(mean.TA = mean(TA, na.rm = TRUE)), aes(xintercept = mean.TA), linetype = "dashed", col = "red") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(st.TA = quantile(TA, 0.25, na.rm = TRUE)), aes(xintercept = st.TA), linetype = "dashed", col = "orange") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(rd.TA = quantile(TA, 0.75, na.rm = TRUE)), aes(xintercept = rd.TA), linetype = "dashed", col = "orange")
+
+
+```
+
+
+### Credit Quality (Loan Loss Provision as % of Loans)
+```{r}
+data %>%
+  ggplot(aes(x = LoanLossProv_pct)) +
+  geom_histogram(bins = 75) +
+  facet_wrap(~ Year) +
+  scale_x_continuous(labels = percent_format()) +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(mean.LoanLossProv_pct = mean(LoanLossProv_pct, na.rm = TRUE)), aes(xintercept = mean.LoanLossProv_pct), linetype = "dashed", col = "red") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(st.LoanLossProv_pct = quantile(LoanLossProv_pct, 0.25, na.rm = TRUE)), aes(xintercept = st.LoanLossProv_pct), linetype = "dashed", col = "orange") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(rd.LoanLossProv_pct = quantile(LoanLossProv_pct, 0.75, na.rm = TRUE)), aes(xintercept = rd.LoanLossProv_pct), linetype = "dashed", col = "orange")
+
+
+```
+
+### Credit Quality (Non-performing Loans as % of Loans)
+```{r}
+data %>%
+  ggplot(aes(x = NonPerfLoans_pct)) +
+  geom_histogram(bins = 75) +
+  facet_wrap(~ Year) +
+  scale_x_continuous(labels = percent_format()) +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(mean.LoanLossProv_pct = mean(LoanLossProv_pct, na.rm = TRUE)), aes(xintercept = mean.LoanLossProv_pct), linetype = "dashed", col = "red") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(st.LoanLossProv_pct = quantile(LoanLossProv_pct, 0.25, na.rm = TRUE)), aes(xintercept = st.LoanLossProv_pct), linetype = "dashed", col = "orange") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(rd.LoanLossProv_pct = quantile(LoanLossProv_pct, 0.75, na.rm = TRUE)), aes(xintercept = rd.LoanLossProv_pct), linetype = "dashed", col = "orange")
+
+
+```
+
+### Managment Efficiency (Cost of Revenue)
+```{r, warning=FALSE}
+data %>%
+  ggplot(aes(x = Efficiency)) +
+  geom_histogram(bins = 75) +
+  xlim(0,180) +
+  facet_wrap(~ Year) +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(mean.Efficiency = mean(Efficiency)), aes(xintercept = mean.Efficiency), linetype = "dashed", col = "red") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(st.Efficiency = quantile(Efficiency, 0.25)), aes(xintercept = st.Efficiency), linetype = "dashed", col = "orange") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(rd.Efficiency = quantile(Efficiency, 0.75)), aes(xintercept = rd.Efficiency), linetype = "dashed", col = "orange")
+
+
+```
+
+### Capitalisation (Tier 1 capital as % of Risk-weighted Assets)
+```{r, warning=FALSE}
+data %>%
+  ggplot(aes(x = T1_pct)) +
+  geom_histogram(bins = 75) +
+  facet_wrap(~ Year) +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(mean.T1_pct = mean(T1_pct, na.rm = TRUE)), aes(xintercept = mean.T1_pct), linetype = "dashed", col = "red") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(st.T1_pct = quantile(T1_pct, 0.25, na.rm = TRUE)), aes(xintercept = st.T1_pct), linetype = "dashed", col = "orange") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(rd.T1_pct = quantile(T1_pct, 0.75, na.rm = TRUE)), aes(xintercept = rd.T1_pct), linetype = "dashed", col = "orange")
+
+
+```
+
+### Capitalisation (Capital as % of Total Assets)
+```{r}
+data %>%
+  ggplot(aes(x = LeverageRatio)) +
+  geom_histogram(bins = 75) +
+  facet_wrap(~ Year) +
+  scale_x_continuous(labels = percent_format()) +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(mean.LeverageRatio = mean(LeverageRatio, na.rm = TRUE)), aes(xintercept = mean.LeverageRatio), linetype = "dashed", col = "red") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(st.LeverageRatio = quantile(LeverageRatio, 0.25, na.rm = TRUE)), aes(xintercept = st.LeverageRatio), linetype = "dashed", col = "orange") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(rd.LeverageRatio = quantile(LeverageRatio, 0.75, na.rm = TRUE)), aes(xintercept = rd.LeverageRatio), linetype = "dashed", col = "orange")
+
+
+```
+
+
+### Diversification (% of Non-Interest Income)
+```{r}
+data %>%
+  ggplot(aes(x = NonIntInc_pct)) +
+  geom_histogram(bins = 75) +
+  facet_wrap(~ Year) +
+  scale_x_continuous(labels = percent_format()) +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(mean.NonIntInc_pct = mean(NonIntInc_pct, na.rm = TRUE)), aes(xintercept = mean.NonIntInc_pct), linetype = "dashed", col = "red") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(st.NonIntInc_pct = quantile(NonIntInc_pct, 0.25, na.rm = TRUE)), aes(xintercept = st.NonIntInc_pct), linetype = "dashed", col = "orange") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(rd.NonIntInc_pct = quantile(NonIntInc_pct, 0.75, na.rm = TRUE)), aes(xintercept = rd.NonIntInc_pct), linetype = "dashed", col = "orange")
+
+```
+
+
+### Liquidity proxy (Loans to Deposits)
+```{r}
+data %>%
+  ggplot(aes(x = LtD)) +
+  geom_histogram(bins = 75) +
+  facet_wrap(~ Year) +
+  scale_x_continuous(labels = percent_format()) +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(mean.LtD = mean(LtD, na.rm = TRUE)), aes(xintercept = mean.LtD), linetype = "dashed", col = "red") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(st.LtD = quantile(LtD, 0.25, na.rm = TRUE)), aes(xintercept = st.LtD), linetype = "dashed", col = "orange") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(rd.LtD = quantile(LtD, 0.75, na.rm = TRUE)), aes(xintercept = rd.LtD), linetype = "dashed", col = "orange")
+
+```
+
+
+### Financing (Long-term Debt as % of Total Assets)
+```{r}
+data %>%
+  ggplot(aes(x = LongTermDebt_pct)) +
+  geom_histogram(bins = 75) +
+  facet_wrap(~ Year) +
+  scale_x_continuous(labels = percent_format()) +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(mean.LongTermDebt_pct = mean(LongTermDebt_pct, na.rm = TRUE)), aes(xintercept = mean.LongTermDebt_pct), linetype = "dashed", col = "red") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(st.LongTermDebt_pct = quantile(LongTermDebt_pct, 0.25, na.rm = TRUE)), aes(xintercept = st.LongTermDebt_pct), linetype = "dashed", col = "orange") +
+  geom_vline(data = data %>% group_by(Year) %>% summarise(rd.LongTermDebt_pct = quantile(LongTermDebt_pct, 0.75, na.rm = TRUE)), aes(xintercept = rd.LongTermDebt_pct), linetype = "dashed", col = "orange")
+
+
+
+```
+
+# Outliers
+
+```{r}
+residual %>%
+  ggplot(aes(x = r)) +
+  geom_histogram(bins = 75) +
+  scale_x_continuous(breaks = seq(-100, 100, 10))
+
+```
+
+
+## group by RoE category 
+
+### Top half RoE
+
+```{r}
+data_stata_z_gather %>%
+  filter(variable != "Inflation" & variable != "GDP_pct" & variable != "T1LeverageRatio") %>%
+  mutate(variable = as.factor(variable),
+         variable = factor(variable, levels(variable)[c(11, 10, 13, 3, 12, 4, 9, 7, 5, 6, 8, 1, 2)])) %>%
+  ggplot(aes(y = value, x = variable, fill = factor(RoE_top_50))) +
+  geom_boxplot(outlier.colour = NA) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5),
+        axis.title.x = element_blank()) +
+  labs(y = "z-score", fill = "RoE in top 50%")
+
+```
+
+### By RoE quartiles
+
+```{r}
+data_stata_z_gather %>%
+  filter(variable != "Inflation" & variable != "GDP_pct" & variable != "T1LeverageRatio") %>%
+  mutate(variable = as.factor(variable),
+         variable = factor(variable, levels(variable)[c(11, 10, 13, 3, 12, 4, 9, 7, 5, 6, 8, 1, 2)])) %>%
+  ggplot(aes(y = value, x = variable, fill = factor(RoE_quartiles))) +
+  geom_boxplot(outlier.colour = NA) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.9, hjust = 0.9),
+        axis.title.x = element_blank()) +
+  scale_fill_discrete(name = "RoE by quartiles", labels = c("1st quartile", "2nd quartile", "3rd quartile", "4th quartile")) + 
+  scale_x_discrete(labels=c("TA" = "ln(TA)", "LeverageRatio" = "Leverage Ratio", "T1_pct" = "T1 (% RWAs)",
+                              "LoanLossProv_pct" = "Loan Loss Provisions", "NonPerfLoans_pct" = "Non-performing Loans", "LtD" = "Loans to Deposits", "LoanstoTA" = "Loans to Total Assets", "LongTermDebt_pct" = "Long-term Debt", "NonIntInc_pct" = "Non-interest income", "est_RW" = "average risk-weight")) +
+  labs(y = "z-score", fill = "RoE by quartiles")
+
+```
+
+Z-score
+
+```{r}
+data_stata_z_gather %>%
+  filter(variable != "Inflation" & variable != "GDP_pct" & variable != "T1LeverageRatio" & variable != "est_RW") %>%
+  mutate(variable = as.factor(variable),
+         variable = factor(variable, levels(variable)[c(10, 9, 12, 1, 7, 2, 11, 3, 8, 6, 4, 5)],
+                           labels = c("RoE", "RoA", "ln(TA)", "Efficiency", "Non-interest income", "Leverage Ratio", "T1 (% RWAs)", "Loan Loss Provisions", "Non-performing Loans", "Loans to Deposits", "Loans to Total Assets", "Long-term Debt"))) %>%
+  ggplot(aes(y = value, x = variable, fill = factor(RoE_quartiles))) +
+  geom_boxplot(outlier.colour = "grey") +
+  scale_fill_discrete(name = "RoE by quartiles", labels = c("1st quartile", "2nd quartile", "3rd quartile", "4th quartile")) + 
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  facet_wrap(~ variable, scales = "free_x") +
+  labs(y = "z-score", fill = "RoE by quartiles")
+
+```
+
+No need for z-score with scale free :)
+
+```{r}
+data_stata_win %>%
+  mutate(TA = log(TA),
+         LoanstoTA = LoanstoTA*100,
+         NonIntInc_pct = NonIntInc_pct*100,
+         T1LeverageRatio = T1LeverageRatio*100,
+         LoanLossProv_pct = LoanLossProv_pct*100,
+         NonPerfLoans_pct = NonPerfLoans_pct*100,
+         LongTermDebt_pct = LongTermDebt_pct*100,
+         LtD = LtD*100,
+         LeverageRatio = LeverageRatio*100,
+         RoE_1 = if_else(RoE <= quantile(RoE, 0.25), 1, 0),
+         RoE_2 = if_else(RoE > quantile(RoE, 0.25) & RoE <= quantile(RoE, 0.50), 1, 0),
+         RoE_3 = if_else(RoE > quantile(RoE, 0.50) & RoE <= quantile(RoE, 0.75), 1, 0),
+         RoE_4 = if_else(RoE > quantile(RoE, 0.75) & RoE <= quantile(RoE, 1), 1, 0),
+         RoE_quartiles = if_else(RoE <= quantile(RoE, 0.25), 1, if_else(RoE <= quantile(RoE, 0.50), 2, if_else(RoE <= quantile(RoE, 0.75), 3, if_else(RoE <= quantile(RoE, 1), 4, 0)))),
+         RoE_top_10 = if_else(RoE > quantile(RoE, 0.90), 1, 0),
+         RoE_bottom_10 = if_else(RoE < quantile(RoE, 0.1), 1, 0),
+         RoE_top_50 = if_else(RoE > quantile(RoE, 0.5), 1, 0)) %>%
+  gather(key = "variable", value = "value", TA:LeverageRatio, T1_pct:LoanLossProv_pct, LongTermDebt_pct, est_RW) %>%
+  mutate(variable = as.factor(variable), 
+         variable = factor(variable, levels(variable)[c(10, 9, 12, 1, 8, 3, 11, 2, 4, 7, 5, 6)], 
+                           labels = c("RoE", "RoA", "Size - ln(TA)", "Efficiency", "Diversification", "Leverage Ratio", "Risk-Weighted Capital", "Average Risk-Weight", "Loan Loss Provisions", "Loans to Deposits", "Loans to Total Assets", "Long-Term Debt"))) %>%
+  ggplot(aes(y = value, x = variable, fill = factor(RoE_quartiles))) +
+  geom_boxplot(outlier.colour = "grey") +
+  scale_fill_discrete(name = "RoE by quartiles", labels = c("1st quartile", "2nd quartile", "3rd quartile", "4th quartile")) + 
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.x = element_blank(), axis.title.y = element_blank(),
+        panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(), 
+        plot.background = element_rect(fill = "white"),
+        panel.background = element_rect(fill = "white", colour = "grey50"),
+        axis.ticks.y = element_line(colour = "black")) +
+  facet_wrap(~ variable, scales = "free")
+
+```
+
+#### RoA
+
+```{r}
+data_stata_win %>%
+  mutate(TA = log(TA),
+         LoanstoTA = LoanstoTA*100,
+         NonIntInc_pct = NonIntInc_pct*100,
+         T1LeverageRatio = T1LeverageRatio*100,
+         LoanLossProv_pct = LoanLossProv_pct*100,
+         NonPerfLoans_pct = NonPerfLoans_pct*100,
+         LongTermDebt_pct = LongTermDebt_pct*100,
+         LtD = LtD*100,
+         LeverageRatio = LeverageRatio*100,
+         RoA_1 = if_else(RoA <= quantile(RoA, 0.25), 1, 0),
+         RoA_2 = if_else(RoA > quantile(RoA, 0.25) & RoA <= quantile(RoA, 0.50), 1, 0),
+         RoA_3 = if_else(RoA > quantile(RoA, 0.50) & RoA <= quantile(RoA, 0.75), 1, 0),
+         RoA_4 = if_else(RoA > quantile(RoA, 0.75) & RoA <= quantile(RoA, 1), 1, 0),
+         RoA_quartiles = if_else(RoA <= quantile(RoA, 0.25), 1, if_else(RoA <= quantile(RoA, 0.50), 2, if_else(RoA <= quantile(RoA, 0.75), 3, if_else(RoA <= quantile(RoA, 1), 4, 0)))),
+         RoA_top_10 = if_else(RoA > quantile(RoA, 0.90), 1, 0),
+         RoA_bottom_10 = if_else(RoA < quantile(RoA, 0.1), 1, 0),
+         RoA_top_50 = if_else(RoA > quantile(RoA, 0.5), 1, 0)) %>%
+  gather(key = "variable", value = "value", TA:LeverageRatio, T1_pct:LoanLossProv_pct, LongTermDebt_pct, est_RW) %>%
+  mutate(variable = as.factor(variable), 
+         variable = factor(variable, levels(variable)[c(9, 10, 12, 1, 8, 3, 11, 2, 4, 7, 5, 6)], 
+                           labels = c("RoA", "RoE", "Size - ln(TA)", "Efficiency", "Diversification", "Leverage Ratio", "Risk-Weighted Capital", "Average Risk-Weight", "Loan Loss Provisions", "Loans to Deposits", "Loans to Total Assets", "Long-Term Debt"))) %>%
+  ggplot(aes(y = value, x = variable, fill = factor(RoA_quartiles))) +
+  geom_boxplot(outlier.colour = "grey") +
+  scale_fill_discrete(name = "RoA by quartiles", labels = c("1st quartile", "2nd quartile", "3rd quartile", "4th quartile")) + 
+  theme_bw() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.x = element_blank(), axis.title.y = element_blank(),
+        panel.grid.major.x = element_blank(), panel.grid.minor = element_blank(), 
+        plot.background = element_rect(fill = "white"),
+        panel.background = element_rect(fill = "white", colour = "grey50"),
+        axis.ticks.y = element_line(colour = "black")) +
+  facet_wrap(~ variable, scales = "free")
+
+```
+
+#### Comparing impact of risk-weights
+
+```{r}
+RoA_RW <- data_stata_win %>%
+  mutate(TA = log(TA),
+         LoanstoTA = LoanstoTA*100,
+         NonIntInc_pct = NonIntInc_pct*100,
+         T1LeverageRatio = T1LeverageRatio*100,
+         LoanLossProv_pct = LoanLossProv_pct*100,
+         NonPerfLoans_pct = NonPerfLoans_pct*100,
+         LongTermDebt_pct = LongTermDebt_pct*100,
+         LtD = LtD*100,
+         LeverageRatio = LeverageRatio*100,
+         RoA_1 = if_else(RoA <= quantile(RoA, 0.25), 1, 0),
+         RoA_2 = if_else(RoA > quantile(RoA, 0.25) & RoA <= quantile(RoA, 0.50), 1, 0),
+         RoA_3 = if_else(RoA > quantile(RoA, 0.50) & RoA <= quantile(RoA, 0.75), 1, 0),
+         RoA_4 = if_else(RoA > quantile(RoA, 0.75) & RoA <= quantile(RoA, 1), 1, 0),
+         RoA_quartiles = if_else(RoA <= quantile(RoA, 0.25), 1, if_else(RoA <= quantile(RoA, 0.50), 2, if_else(RoA <= quantile(RoA, 0.75), 3, if_else(RoA <= quantile(RoA, 1), 4, 0)))),
+         RoA_top_10 = if_else(RoA > quantile(RoA, 0.90), 1, 0),
+         RoA_bottom_10 = if_else(RoA < quantile(RoA, 0.1), 1, 0),
+         RoA_top_50 = if_else(RoA > quantile(RoA, 0.5), 1, 0)) %>%
+  gather(key = "variable", value = "value", est_RW) %>%
+  filter(variable != "Inflation" & variable != "GDP_pct") %>%
+  ggplot(aes(y = value, x = variable, fill = factor(RoA_quartiles))) +
+  geom_boxplot(outlier.colour = "grey") +
+  scale_fill_discrete(name = "RoA by quartiles", labels = c("1st quartile", "2nd quartile", "3rd quartile", "4th quartile")) + 
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_blank()) +
+  facet_wrap(~ variable, scales = "free")
+
+RoE_RW <- data_stata_win %>%
+  mutate(TA = log(TA),
+         LoanstoTA = LoanstoTA*100,
+         NonIntInc_pct = NonIntInc_pct*100,
+         T1LeverageRatio = T1LeverageRatio*100,
+         LoanLossProv_pct = LoanLossProv_pct*100,
+         NonPerfLoans_pct = NonPerfLoans_pct*100,
+         LongTermDebt_pct = LongTermDebt_pct*100,
+         LtD = LtD*100,
+         LeverageRatio = LeverageRatio*100,
+         RoE_1 = if_else(RoE <= quantile(RoE, 0.25), 1, 0),
+         RoE_2 = if_else(RoE > quantile(RoE, 0.25) & RoE <= quantile(RoE, 0.50), 1, 0),
+         RoE_3 = if_else(RoE > quantile(RoE, 0.50) & RoE <= quantile(RoE, 0.75), 1, 0),
+         RoE_4 = if_else(RoE > quantile(RoE, 0.75) & RoE <= quantile(RoE, 1), 1, 0),
+         RoE_quartiles = if_else(RoE <= quantile(RoE, 0.25), 1, if_else(RoE <= quantile(RoE, 0.50), 2, if_else(RoE <= quantile(RoE, 0.75), 3, if_else(RoE <= quantile(RoE, 1), 4, 0)))),
+         RoE_top_10 = if_else(RoE > quantile(RoE, 0.90), 1, 0),
+         RoE_bottom_10 = if_else(RoE < quantile(RoE, 0.1), 1, 0),
+         RoE_top_50 = if_else(RoE > quantile(RoE, 0.5), 1, 0)) %>%
+  gather(key = "variable", value = "value", est_RW) %>%
+  filter(variable != "Inflation" & variable != "GDP_pct") %>%
+  ggplot(aes(y = value, x = variable, fill = factor(RoE_quartiles))) +
+  geom_boxplot(outlier.colour = "grey") +
+  scale_fill_discrete(name = "RoE by quartiles", labels = c("1st quartile", "2nd quartile", "3rd quartile", "4th quartile")) + 
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.y = element_blank()) +
+  facet_wrap(~ variable, scales = "free")
+
+grid.arrange(RoE_RW, RoA_RW, ncol=2)
+
+```
+
+
+
+### top 10% RoE
+
+```{r}
+data_stata_z_gather %>%
+  filter(variable != "Inflation" & variable != "GDP_pct" & variable != "T1LeverageRatio") %>%
+  mutate(variable = as.factor(variable),
+         variable = factor(variable, levels(variable)[c(11, 10, 13, 3, 12, 4, 9, 7, 5, 6, 8, 1, 2)])) %>%
+  ggplot(aes(y = value, x = variable, fill = factor(RoE_top_10))) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5),
+        axis.title.x = element_blank())  +
+  labs(y = "z-score", fill = "RoE in top 10%")
+
+```
+
+### bottom 10% RoE
+
+```{r}
+data_stata_z_gather %>%
+  filter(variable != "Inflation" & variable != "GDP_pct" & variable != "T1LeverageRatio") %>%
+  mutate(variable = as.factor(variable),
+         variable = factor(variable, levels(variable)[c(11, 10, 13, 3, 12, 4, 9, 7, 5, 6, 8, 1, 2)])) %>%
+  ggplot(aes(y = value, x = variable, fill = factor(RoE_bottom_10))) +
+  geom_boxplot() +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.ticks.x = element_blank())  +
+  labs(y = "z-score", fill = "RoE in bottom 10%") +
+  facet_wrap(~variable, scales ="free_x")
+
+```
+
+
+
+
+```{r}
+data_stata_z_gather %>%
+  mutate(RoE_top_50 = factor(RoE_top_50)) %>%
+  select(id, Year, variable, value, RoE_top_50) %>%
+  spread(key = variable, value = value) %>%
+  select(1:5, 8:14, 17:18, 15:16) %>%
+  ggparcoord(alpha = .1,
+             scale = "center",
+             columns = 4:16,
+             groupColumn = "RoE_top_50")
+
+```
+
+```{r}
+data_stata_z_gather %>%
+  filter(Year == 2010) %>%
+  mutate(RoE_4 = factor(RoE_4)) %>%
+  select(id, Year, variable, value, RoE_4) %>%
+  spread(key = variable, value = value) %>%
+  select(1:5, 8:14, 17, 15:16) %>%
+  ggparcoord(alpha = .3,
+             scale = "center",
+             columns = 4:15,
+             groupColumn = "RoE_4")
+
+```
+
+## examples of outliers
+### Loans to Deposits
+
+Original
+
+```{r}
+data_select %>%
+  #filter(Year == 2010) %>%
+  ggplot(aes(y = RoE, x = LtD)) +
+  geom_point() +
+  scale_x_continuous(labels = percent_format()) +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+
+```
+
+vs Winsorised
+
+```{r}
+data_stata_win %>%
+  #filter(Year == 2010) %>%
+  ggplot(aes(y = RoE, x = LtD)) +
+  geom_point() +
+  scale_x_continuous(labels = percent_format()) +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+
+```
+
+```{r}
+data_stata_z_year_win %>%
+  #filter(Year == 2010) %>%
+  ggplot(aes(y = RoE, x = LtD)) +
+  geom_point() +
+  scale_x_continuous(labels = percent_format()) +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+
+```
+
+### Efficiency
+
+Original 
+
+```{r}
+data_select %>%
+  #filter(Year == 2010) %>%
+  ggplot(aes(y = RoE, x = Efficiency)) +
+  geom_point() +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+
+```
+
+vs Winsorised
+
+```{r}
+data_stata_win %>%
+  #filter(Year == 2010) %>%
+  ggplot(aes(y = RoE, x = Efficiency)) +
+  geom_jitter(width = 0.5, height = 0.5) +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+
+```
+
+vs Z-score by year winsorised
+
+```{r}
+data_stata_z_year_win %>%
+  #filter(Year == 2010) %>%
+  ggplot(aes(y = RoE, x = Efficiency)) +
+  geom_jitter(width = 0.5, height = 0.5) +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+
+```
+
+### Leverage Ratio
+
+Original
+```{r}
+data_select %>%
+  #filter(Year == 2010) %>%
+  ggplot(aes(y = RoE, x = LeverageRatio)) +
+  geom_point() +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+
+```
+
+vs Winsorised
+
+```{r}
+data_stata_win %>%
+  #filter(Year == 2010) %>%
+  ggplot(aes(y = RoE, x = LeverageRatio)) +
+  geom_point() +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+
+```
+
+vs Z-score by year winsorised
+
+```{r}
+data_stata_z_year_win %>%
+  #filter(Year == 2010) %>%
+  ggplot(aes(y = RoE, x = LeverageRatio)) +
+  geom_point() +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+
+```
+
+### Loan Loss provision
+
+Original 
+```{r}
+data_select %>%
+  #filter(Year == 2010) %>%
+  ggplot(aes(y = RoE, x = LoanLossProv_pct)) +
+  geom_point() +
+  scale_x_continuous(labels = percent_format()) +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+
+```
+
+vs Winsorised
+
+```{r}
+data_stata_win %>%
+  #filter(Year == 2010) %>%
+  ggplot(aes(y = RoE, x = LoanLossProv_pct)) +
+  geom_point() +
+  scale_x_continuous(labels = percent_format()) +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+
+```
+
+### Z-score by year winsorised
+
+```{r}
+data_stata_z_year_win %>%
+  #filter(Year == 2010) %>%
+  ggplot(aes(y = RoE, x = LoanLossProv_pct)) +
+  geom_point() +
+  scale_x_continuous(labels = percent_format()) +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+
+```
+
+### Non-performing loans
+```{r}
+data_select %>%
+  filter(Year == 2010) %>%
+  ggplot(aes(y = RoE, x = NonPerfLoans_pct)) +
+  geom_point() +
+  scale_x_continuous(labels = percent_format()) +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+```
+
+### Non-interest income
+```{r}
+data_select %>%
+  filter(Year == 2018) %>%
+  ggplot(aes(y = RoE, x = NonIntInc_pct)) +
+  geom_point() +
+  scale_x_continuous(labels = percent_format()) +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+```
+
+### Non-interest income
+```{r}
+data_stata_win %>%
+  ggplot(aes(y = RoE, x = NonIntInc_pct)) +
+  geom_point() +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+```
+
+```{r}
+data_stata_z_year_win %>%
+  ggplot(aes(y = RoE, x = NonIntInc_pct)) +
+  geom_point() +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+```
+
+## 98th percentile vs Z-score winsorisation
+
+```{r}
+data_stata %>%
+  ggplot(aes(x = LeverageRatio)) +
+  geom_histogram(bins = 100, alpha = 0.5,) +
+  geom_histogram(data = data_stata_win, fill = "green", alpha = 0.2, bins = 100) +
+  geom_histogram(data = data_stata_z_win, fill = "red", alpha = 0.2, bins = 100) +
+  scale_x_continuous(labels = percent_format()) +
+  #geom_vline(xintercept = 1) +
+  #geom_vline(data = data_stata_win %>% group_by(Year) %>% summarise(median = median((T1_pct/100)/LeverageRatio, na.rm = TRUE)), aes(xintercept = median), linetype = "dashed", col = "red") +
+  labs()
+```
+
+```{r}
+data_stata %>%
+  ggplot(aes(x = LoanLossProv_pct)) +
+  geom_histogram(bins = 100, alpha = 0.3) +
+  geom_histogram(data = data_stata_win, fill = "green", alpha = 0.3, bins = 100) +
+  geom_histogram(data = data_stata_z_win, fill = "red", alpha = 0.3, bins = 100) +
+  scale_x_continuous(labels = percent_format()) +
+  #geom_vline(xintercept = 1) +
+  #geom_vline(data = data_stata_win %>% group_by(Year) %>% summarise(median = median((T1_pct/100)/LeverageRatio, na.rm = TRUE)), aes(xintercept = median), linetype = "dashed", col = "red") +
+  labs() +
+  facet_wrap(~ Year)
+```
+
+```{r}
+data_stata %>%
+  ggplot(aes(x = LtD)) +
+  geom_histogram(bins = 100, alpha = 0.5,) +
+  geom_histogram(data = data_stata_win, fill = "green", alpha = 0.2, bins = 100) +
+  geom_histogram(data = data_stata_z_win, fill = "red", alpha = 0.2, bins = 100) +
+  scale_x_continuous(labels = percent_format()) +
+  #geom_vline(xintercept = 1) +
+  #geom_vline(data = data_stata_win %>% group_by(Year) %>% summarise(median = median((T1_pct/100)/LeverageRatio, na.rm = TRUE)), aes(xintercept = median), linetype = "dashed", col = "red") +
+  labs()
+```
+
+```{r}
+data_stata %>%
+  ggplot(aes(x = NonIntInc_pct)) +
+  geom_histogram(bins = 100, alpha = 0.5,) +
+  geom_histogram(data = data_stata_win, fill = "green", alpha = 0.2, bins = 100) +
+  geom_histogram(data = data_stata_z_win, fill = "red", alpha = 0.2, bins = 100) +
+  scale_x_continuous(labels = percent_format()) +
+  #geom_vline(xintercept = 1) +
+  #geom_vline(data = data_stata_win %>% group_by(Year) %>% summarise(median = median((T1_pct/100)/LeverageRatio, na.rm = TRUE)), aes(xintercept = median), linetype = "dashed", col = "red") +
+  labs()
+```
+
+```{r}
+data_stata %>%
+  ggplot(aes(x = Efficiency)) +
+  geom_histogram(bins = 100, alpha = 0.5,) +
+  geom_histogram(data = data_stata_win, fill = "green", alpha = 0.2, bins = 100) +
+  geom_histogram(data = data_stata_z_win, fill = "red", alpha = 0.2, bins = 100) +
+  #geom_vline(xintercept = 1) +
+  #geom_vline(data = data_stata_win %>% group_by(Year) %>% summarise(median = median((T1_pct/100)/LeverageRatio, na.rm = TRUE)), aes(xintercept = median), linetype = "dashed", col = "red") +
+  labs()
+```
+
+## Examining correlated metrics
+
+### LR and T1_pct
+```{r}
+data_stata_win %>%
+  #filter(Year == 2017) %>%
+  ggplot(aes(y = LeverageRatio, x = T1_pct/100)) +
+  geom_point() +
+  scale_x_continuous(labels = percent_format()) +
+  scale_y_continuous(labels = percent_format()) +
+  geom_abline(intercept = 0, linetype = "dashed") +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  labs(x = "T1 as % of RWAs", y = "Leverage Ratio") +
+  facet_wrap(~ Year)
+```
+
+T1 as % of RWAs was around 125% of the Leverage Ratio, but has been falling in the recent years to around 105% of LR. Not sure if T1_pct is falling or LR increasing.
+
+```{r}
+data_stata_win %>%
+  ggplot(aes(x = (T1_pct/100)/LeverageRatio)) +
+  geom_histogram() +
+  scale_x_continuous(labels = percent_format()) +
+  geom_vline(xintercept = 1) +
+  geom_vline(data = data_stata_win %>% group_by(Year) %>% summarise(median = median((T1_pct/100)/LeverageRatio, na.rm = TRUE)), aes(xintercept = median), linetype = "dashed", col = "red") +
+  labs(x = "T1 RWCR as percent of Leverage Ratio") +
+  facet_wrap(~ Year)
+```
+
+Convergence mainlu due to fall in T1 as % of RWAs, but LR increased as well.
+
+=> also evidence RW has increased. Requiring a higher LR for the same T1 RWC
+
+```{r}
+data_stata_win %>%
+  mutate(T1_pct = T1_pct/100) %>%
+  gather(key = "capital_ratio", value = "value", T1_pct, LeverageRatio) %>%
+  ggplot(aes(x = value, fill = capital_ratio)) +
+  geom_histogram(alpha = 0.5, position="identity") +
+  geom_vline(data = data_stata_win %>% group_by(Year) %>% summarise(T1_median = median(T1_pct, na.rm = TRUE)/100), aes(xintercept = T1_median), linetype = "dashed", col = "green") +
+  geom_vline(data = data_stata_win %>% group_by(Year) %>% summarise(LR_median = median(LeverageRatio, na.rm = TRUE)), aes(xintercept = LR_median), linetype = "dashed", col = "red") +
+  scale_x_continuous(labels = percent_format()) +
+  labs(x = "Capital ratio") +
+  facet_wrap(~ Year)
+```
+
+```{r}
+data_stata_lag %>%
+  ggplot(aes(x = LeverageRatio, y = RoE)) +
+  geom_point() +
+  scale_x_continuous(labels = percent_format()) +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+```
+
+### LR and TA
+```{r}
+data_stata_win %>%
+  #filter(Year == 2017) %>%
+  ggplot(aes(y = LeverageRatio, x = TA)) +
+  geom_point() +
+  scale_x_log10() +
+  scale_y_continuous(labels = percent_format()) +
+  geom_abline(intercept = 0, linetype = "dashed") +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  labs(y = "Leverage Ratio") +
+  facet_wrap(~ Year)
+```
+
+### LR and TA
+```{r}
+data_stata_win %>%
+  #filter(Year == 2017) %>%
+  ggplot(aes(y = LeverageRatio, x = factor(TA_large), fill = factor(TA_large))) +
+  geom_boxplot() +
+  scale_y_continuous(labels = percent_format()) +
+  labs(y = "Leverage Ratio") +
+  facet_wrap(~ Year)
+```
+
+### T1_pct and TA
+```{r}
+data_stata_win %>%
+  #filter(Year == 2017) %>%
+  ggplot(aes(y = T1_pct, x = TA)) +
+  geom_point() +
+  scale_x_log10() +
+  geom_abline(intercept = 0, linetype = "dashed") +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  labs(y = "Tier 1 (% RWAs)") +
+  facet_wrap(~ Year)
+```
+
+
+#### t-test LR by size
+
+Capital adequacy
+
+```{r}
+t.test(LeverageRatio ~ TA_large, data = data_stata_reg)
+t.test(T1_pct ~ TA_large, data = data_stata_reg)
+mean(data_stata_reg$T1LeverageRatio/data_stata_reg$LeverageRatio, na.rm = TRUE)
+t.test(est_RW ~ TA_large, data = data_stata_reg)
+
+```
+
+Liquidity
+
+```{r}
+t.test(LtD ~ TA_large, data = data_stata_reg)
+t.test(LoanstoTA ~ TA_large, data = data_stata_reg)
+t.test(LongTermDebt_pct ~ TA_large, data = data_stata_reg)
+
+```
+
+Profitability
+
+```{r}
+t.test(RoE ~ TA_large, data = data_stata_reg)
+t.test(RoA ~ TA_large, data = data_stata_reg)
+
+```
+
+Other
+
+```{r}
+t.test(Efficiency ~ TA_large, data = data_stata_reg)
+t.test(LoanLossProv_pct ~ TA_large, data = data_stata_reg)
+t.test(NonIntInc_pct ~ TA_large, data = data_stata_reg)
+
+```
+
+### LtD and Loans to TA
+```{r}
+data_select %>%
+  filter(Year == 2017) %>%
+  ggplot(aes(y = LtD, x = LoanstoTA)) +
+  geom_point() +
+  scale_x_continuous(labels = percent_format()) +
+  scale_y_continuous(labels = percent_format()) +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+```
+
+
+
+```{r}
+data_select %>%
+  filter(Year == 2017) %>%
+  ggplot(aes(y = RoE, x = LoanstoTA)) +
+  geom_point() +
+  scale_x_continuous(labels = percent_format()) +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+```
+
+
+
+```{r}
+data_select %>%
+  filter(Year == 2017) %>%
+  ggplot(aes(y = RoE, x = LtD)) +
+  geom_point() +
+  scale_x_continuous(labels = percent_format()) +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+```
+
+
+```{r}
+data_select %>%
+  filter(Year == 2017) %>%
+  ggplot(aes(y = RoE, x = -5.7*LtD + 7.1*LoanstoTA)) +
+  geom_point() +
+  scale_x_continuous(labels = percent_format()) +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+```
+
+
+```{r}
+data_select %>%
+  filter(Year == 2017) %>%
+  ggplot(aes(y = RoE, x = LoanstoTA/LtD)) +
+  geom_point() +
+  scale_x_continuous(labels = percent_format()) +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  labs(x = "Deposits to TA") + 
+  facet_wrap(~ Year)
+```
+
+#### debt to RoE
+```{r}
+data_select %>%
+  filter(Year == 2017) %>%
+  ggplot(aes(y = RoE, x = LongTermDebt_pct)) +
+  geom_point() +
+  scale_x_continuous(labels = percent_format()) +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  labs() + 
+  facet_wrap(~ Year)
+```
+
+### longterm debt to deposits
+```{r}
+data_select %>%
+  filter(Year == 2017) %>%
+  ggplot(aes(y = LongTermDebt_pct, x = LoanstoTA/LtD)) +
+  geom_point() +
+  scale_x_continuous(labels = percent_format()) +
+  scale_y_continuous(labels = percent_format()) +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  labs(x = "Deposits to TA") + 
+  facet_wrap(~ Year)
+```
+
+### NonIntIncome and Loans to TA
+```{r}
+data_select %>%
+  filter(Year == 2017) %>%
+  ggplot(aes(y = NonIntInc_pct, x = LoanstoTA)) +
+  geom_point() +
+  scale_x_continuous(labels = percent_format()) +
+  scale_y_continuous(labels = percent_format()) +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  facet_wrap(~ Year)
+```
+
+
+### Testing impact of Deposits from regression without deposits
+```{r}
+data_select %>%
+  filter(Year == 2017) %>%
+  ggplot(aes(y = -5.74*LtD + 7.18*LoanstoTA, x = LoanstoTA/LtD)) +
+  geom_point() +
+  geom_abline(intercept = -4, slope = 4.9, color="red",
+              linetype="dashed", size=1.5) +
+  scale_x_continuous(labels = percent_format()) +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  labs(x = "Deposits to TA") + 
+  facet_wrap(~ Year)
+```
+
+```{r}
+data_stata %>%
+  filter(Year == 2017) %>%
+  ggplot(aes(y = RoE, x = -5.74*LtD + 7.18*LoanstoTA + 17.39*LongTermDebt_pct - .2436*Efficiency - 421*LoanLossProv_pct - .77*log(TA) + 0.075*T1_pct + 37.9 + 0.65*Inflation + .71*GDP_pct + 23*Outlier_pos - 23.4*Outlier_neg)) +
+  geom_point() +
+  geom_abline(xintercept = 0, linetype = "dashed") +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  labs() + 
+  facet_wrap(~ Year)
+```
+
+```{r, warning = FALSE}
+data_select %>%
+  filter(Year == 2017) %>%
+  ggplot(aes(y = RoE, x = .09*LtD -2.1*LoanstoTA + 17.39*LongTermDebt_pct - .328*Efficiency - 537*LoanLossProv_pct - 1.73*log(TA) + 0.14*T1_pct + 66.8 + 8.1*NonIntInc_pct + 0.60*Inflation + .55*GDP_pct)) +
+  geom_point() +
+  geom_abline(xintercept = 0, linetype = "dashed") +
+  stat_smooth(method = "lm", se = FALSE, linetype = "dashed") +
+  labs() + 
+  facet_wrap(~ Year)
+```
+
+Average Bank will have `summary_2018$mean_LtD*-5.74 + summary_2018$mean_LoanstoTA*7.18` pp change in RoE (due to LtD and LtTA)
+
+A bank with a high loan ratio LtD = 1 and LtTA = 0.8 (deposits = `0.8/1`) will have `1*-5.74 + 0.8*7.18` pp change in RoE
+
+A bank with a low deposit ratio LtD = 2 and LtTA = 0.8 (deposits = `0.8/2`) will have `2*-5.74 + 0.8*7.18` pp change in RoE
+
+```{r, warning = FALSE}
+data_stata_changes %>%
+  ggplot(aes(x = TA)) +
+  geom_histogram()
+
+```
+
+
+# Fixed or Random effects charts
+
+Looking at 14 "random" samples
+
+## LtD
+
+```{r, warning = FALSE}
+data_stata_win %>%
+  left_join(random, by = c("id")) %>%
+  filter(random == 1) %>%
+  ggplot(aes(x = LtD, y = RoE, group = Bank, col = Bank)) +
+  geom_point() +
+  geom_smooth(method = "lm", linetype = "dashed", se = FALSE) +
+  geom_smooth(aes(group = 1), method = "lm", linetype = "dashed", se = FALSE, colour = "black", size = 2) +
+  scale_y_continuous(limits = c(0, 30))
+```
+
+
+```{r, warning = FALSE}
+data_stata_win %>%
+  left_join(random, by = c("id")) %>%
+  filter(random == 1) %>%
+  ggplot(aes(x = LtD, y = RoE, group = factor(Year), col = factor(Year))) +
+  geom_point() +
+  geom_smooth(method = "lm", linetype = "dashed", se = FALSE) +
+  geom_smooth(aes(group = 1), method = "lm", linetype = "dashed", se = FALSE, colour = "black", size = 2) +
+  scale_y_continuous(limits = c(0, 30))
+```
+
+
+## TA
+-> very different for individual vs agreggate 
+
+```{r, warning = FALSE}
+data_stata_win %>%
+  left_join(random, by = c("id")) %>%
+  filter(random == 1) %>%
+  ggplot(aes(x = TA, y = RoE, group = Bank, col = Bank)) +
+  geom_point() +
+  scale_x_log10() +
+  geom_smooth(method = "lm", linetype = "dashed", se = FALSE) +
+  geom_smooth(aes(group = 1), method = "lm", linetype = "dashed", se = FALSE, colour = "black", size = 2) +
+  scale_y_continuous(limits = c(0, 30))
+```
+
+
+```{r, warning = FALSE}
+data_stata_win %>%
+  left_join(random, by = c("id")) %>%
+  filter(random == 1) %>%
+  ggplot(aes(x = TA, y = RoE, group = factor(Year), col = factor(Year))) +
+  geom_point() +
+  scale_x_log10() +
+  geom_smooth(method = "lm", linetype = "dashed", se = FALSE) +
+  geom_smooth(aes(group = 1), method = "lm", linetype = "dashed", se = FALSE, colour = "black", size = 2) +
+  scale_y_continuous(limits = c(0, 30))
+```
+
+## Efficiency
+-> similar for individual and aggregate 
+
+```{r, warning = FALSE}
+data_stata_win %>%
+  left_join(random, by = c("id")) %>%
+  filter(random == 3) %>%
+  ggplot(aes(x = Efficiency, y = RoE, group = Bank, col = Bank)) +
+  geom_point() +
+  geom_smooth(method = "lm", linetype = "dashed", se = FALSE) +
+  geom_smooth(aes(group = 1), method = "lm", linetype = "dashed", se = FALSE, colour = "black", size = 2) +
+  scale_y_continuous(limits = c(0, 30))
+```
+
+With increasing Efficiency the gap between real RoE and epxected RoE increases as Efficiency hasn't been taking into consideration yet.
+
+```{r, warning = FALSE}
+data_stata_win %>%
+  left_join(random, by = c("id")) %>%
+  filter(random == 5) %>%
+  ggplot(aes(x = Efficiency, y = RoE- (40.61+(-0.564*log(TA)-0.0240*LtD+0.0788*NonIntInc_pct-0.262*LeverageRatio-3.942*LoanLossProv_pct+0.571*Inflation+0.721*GDP_pct)), group = Bank, col = Bank)) +
+  geom_point() +
+  geom_smooth(method = "lm", linetype = "dashed", se = FALSE) +
+  geom_smooth(aes(group = 1), method = "lm", linetype = "dashed", se = FALSE, colour = "black", size = 2)
+#+  scale_y_continuous(limits = c(-30, 50))
+```
+
+```{r, warning = FALSE}
+data_stata_win_reg %>%
+  mutate(id = as.integer(id)) %>%
+  left_join(random, by = c("id")) %>%
+  filter(random == 4) %>%
+  ggplot(aes(y = RoE, x = -10+40.61+(-0.564*log(TA)-0.0240*LtD-0.256*Efficiency+0.0788*NonIntInc_pct-0.262*LeverageRatio-3.942*LoanLossProv_pct+0.571*Inflation+0.721*GDP_pct), group = Bank, col = Bank)) +
+  geom_point() +
+  geom_abline(intercept = 0, linetype = "dashed") +
+  geom_smooth(method = "lm", linetype = "dashed", se = FALSE) +
+  geom_smooth(aes(group = 1), method = "lm", linetype = "dashed", se = FALSE, colour = "black", size = 2)
+#+  scale_y_continuous(limits = c(-30, 50))
+```
+
+```{r, warning = FALSE}
+data_stata_win %>%
+  left_join(random, by = c("id")) %>%
+  filter(random == 1) %>%
+  ggplot(aes(x = Efficiency, y = RoE, group = factor(Year), col = factor(Year))) +
+  geom_point() +
+  geom_smooth(method = "lm", linetype = "dashed", se = FALSE) +
+  geom_smooth(aes(group = 1), method = "lm", linetype = "dashed", se = FALSE, colour = "black", size = 2) +
+  scale_y_continuous(limits = c(0, 30))
+```
+
+
+## T1_pct
+-> mixed impact some increasing, some falling
+
+```{r, warning = FALSE}
+data_stata_win %>%
+  left_join(random, by = c("id")) %>%
+  filter(random == 4) %>%
+  ggplot(aes(x = T1_pct, y = RoE, group = Bank, col = Bank)) +
+  geom_point() +
+  geom_smooth(method = "lm", linetype = "dashed", se = FALSE) +
+  geom_smooth(aes(group = 1), method = "lm", linetype = "dashed", se = FALSE, colour = "black", size = 2) +
+  scale_y_continuous(limits = c(0, 30))
+```
+
+
+```{r, warning = FALSE}
+data_stata_win %>%
+  left_join(random, by = c("id")) %>%
+  filter(random < 10) %>%
+  ggplot(aes(x = T1_pct, y = RoE, group = Bank, col = Bank)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  geom_smooth(method = "lm", linetype = "dashed", se = FALSE) +
+  geom_smooth(aes(group = 1), method = "lm", linetype = "dashed", se = FALSE, colour = "black", size = 1) +
+  scale_y_continuous(limits = c(0, 30)) +
+  facet_wrap(~ random) +
+  theme(legend.position = "none")
+```
+
+
+```{r, warning = FALSE}
+data_stata_win %>%
+  left_join(random, by = c("id")) %>%
+  filter(random == 1) %>%
+  ggplot(aes(x = T1_pct, y = RoE, group = factor(Year), col = factor(Year))) +
+  geom_point() +
+  geom_smooth(method = "lm", linetype = "dashed", se = FALSE) +
+  geom_smooth(aes(group = 1), method = "lm", linetype = "dashed", se = FALSE, colour = "black", size = 2) +
+  scale_y_continuous(limits = c(0, 30))
+```
+
+## leverag Ratio
+-> mixed impact some increasing, some falling
+
+```{r, warning = FALSE}
+data_stata_win %>%
+  left_join(random, by = c("id")) %>%
+  filter(random == 1) %>%
+  ggplot(aes(x = LeverageRatio, y = RoE, group = Bank, col = Bank)) +
+  geom_point() +
+  geom_smooth(method = "lm", linetype = "dashed", se = FALSE) +
+  geom_smooth(aes(group = 1), method = "lm", linetype = "dashed", se = FALSE, colour = "black", size = 2) +
+  scale_y_continuous(limits = c(0, 30))
+```
+
+## Loan loss provisions
+
+```{r, warning = FALSE}
+data_stata_win %>%
+  left_join(random, by = c("id")) %>%
+  filter(random == 3) %>%
+  ggplot(aes(x = LoanLossProv_pct, y = RoE, group = Bank, col = Bank)) +
+  geom_point() +
+  geom_smooth(method = "lm", linetype = "dashed", se = FALSE) +
+  geom_smooth(aes(group = 1), method = "lm", linetype = "dashed", se = FALSE, colour = "black", size = 2) +
+  scale_y_continuous(limits = c(0, 30))
+```
+
+
+  
+```{r, warning = FALSE}
+data_stata_win %>%
+  left_join(random, by = c("id")) %>%
+  filter(random == 3) %>%
+  ggplot(aes(x = LoanLossProv_pct, y = RoE, group = factor(Year), col = factor(Year))) +
+  geom_point() +
+  geom_smooth(method = "lm", linetype = "dashed", se = FALSE) +
+  geom_smooth(aes(group = 1), method = "lm", linetype = "dashed", se = FALSE, colour = "black", size = 2) +
+  scale_y_continuous(limits = c(0, 30))
+```
+
+## % non-interest income
+
+```{r, warning = FALSE}
+data_stata_win %>%
+  left_join(random, by = c("id")) %>%
+  filter(random == 3) %>%
+  ggplot(aes(x = NonIntInc_pct, y = RoE, group = Bank, col = Bank)) +
+  geom_point() +
+  geom_smooth(method = "lm", linetype = "dashed", se = FALSE) +
+  geom_smooth(aes(group = 1), method = "lm", linetype = "dashed", se = FALSE, colour = "black", size = 2) +
+  scale_y_continuous(limits = c(0, 30))
+```
+
+Each year the level is different, but relationship the same
+
+```{r, warning = FALSE}
+data_stata_win %>%
+  left_join(random, by = c("id")) %>%
+  filter(random == 1) %>%
+  ggplot(aes(x = NonIntInc_pct, y = RoE, group = factor(Year), col = factor(Year))) +
+  geom_point() +
+  geom_smooth(method = "lm", linetype = "dashed", se = FALSE) +
+  geom_smooth(aes(group = 1), method = "lm", linetype = "dashed", se = FALSE, colour = "black", size = 2) +
+  scale_y_continuous(limits = c(0, 30))
+```
+
+## % long-term debt
+
+```{r, warning = FALSE}
+data_stata_win %>%
+  left_join(random, by = c("id")) %>%
+  filter(random == 1) %>%
+  ggplot(aes(x = LongTermDebt_pct, y = RoE, group = Bank, col = Bank)) +
+  geom_point() +
+  geom_smooth(method = "lm", linetype = "dashed", se = FALSE) +
+  geom_smooth(aes(group = 1), method = "lm", linetype = "dashed", se = FALSE, colour = "black", size = 2) +
+  scale_y_continuous(limits = c(0, 30))
+```
+
+```{r, warning = FALSE}
+data_stata_win %>%
+  left_join(random, by = c("id")) %>%
+  filter(random == 1) %>%
+  ggplot(aes(x = LongTermDebt_pct, y = RoE, group = factor(Year), col = factor(Year))) +
+  geom_point() +
+  geom_smooth(method = "lm", linetype = "dashed", se = FALSE) +
+  geom_smooth(aes(group = 1), method = "lm", linetype = "dashed", se = FALSE, colour = "black", size = 2) +
+  scale_y_continuous(limits = c(0, 30))
+```
+
+
+
+# Subset selection
+
+## ROE
+```{r, warning = FALSE}
+subset_selection <- regsubsets(RoE~., data = data_stata_win_sub %>% select(-RoA), nvmax = 12)
+summary(subset_selection)
+
+```
+```{r, warning = FALSE}
+res.sum <- summary(subset_selection)
+data.frame(
+  Adj.R2 = which.max(res.sum$adjr2),
+  CP = which.min(res.sum$cp),
+  BIC = which.min(res.sum$bic)
+)
+```
+
+```{r, warning = FALSE}
+subset_selection2 <- lm(RoE ~ TA + LtD + LoanstoTA + Efficiency + T1_pct + LeverageRatio + LoanLossProv_pct + NonPerfLoans_pct  + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_win_sub %>% select(-RoA))
+ols_step_forward_p(subset_selection2)
+```
+
+## RoA
+
+```{r, warning = FALSE}
+subset_selection_RoA <- regsubsets(RoA~., data = data_stata_win_sub %>% select(-RoE), nvmax = 12)
+summary(subset_selection_RoA)
+
+```
+
+```{r, warning = FALSE}
+res.sum_RoA <- summary(subset_selection_RoA)
+data.frame(
+  Adj.R2 = which.max(res.sum$adjr2),
+  CP = which.min(res.sum$cp),
+  BIC = which.min(res.sum$bic)
+)
+```
+
+```{r, warning = FALSE}
+subset_selection2_RoA <- lm(RoA ~ TA + LtD + LoanstoTA + Efficiency + T1_pct + LeverageRatio + LoanLossProv_pct + NonPerfLoans_pct  + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_win_sub %>% select(-RoE))
+ols_step_forward_p(subset_selection2_RoA)
+```
+
+# Regression
+
+## On winsorised sample
+
+```{r, warning = FALSE}
+fe_win_within <- plm(RoE ~ TA + LtD + LoanstoTA + Efficiency + LeverageRatio + LoanLossProv_pct  + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct + FED_rate, data = data_stata_win_reg, model = "within")
+
+summary(fe_win_within)
+```
+
+```{r, warning = FALSE}
+fe_win_within <- plm(RoE ~ TA + LtD + Efficiency + LeverageRatio + LoanLossProv_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_win_reg, model = "within")
+
+summary(fe_win_within)
+```
+
+
+### With size buckets
+
+```{r, warning = FALSE}
+fe_win_within_size_buckets <- plm(RoE ~ TA_1 + TA_2 + TA_3 + TA_4 + LtD + LoanstoTA + Efficiency + LeverageRatio + LoanLossProv_pct  + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_win_reg, model = "within")
+
+summary(fe_win_within_size_buckets)
+```
+
+### large banks
+
+LR effect much larger than for small banks
+
+```{r, warning = FALSE}
+fe_win_within_large <- plm(RoE ~ LtD + LoanstoTA + Efficiency + LeverageRatio +  LoanLossProv_pct  + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct + est_RW, data = data_stata_win_reg_large, model = "within")
+
+summary(fe_win_within_large)
+```
+```{r, warning = FALSE}
+fe_win_within_large <- plm(RoE ~ LtD + LoanstoTA + Efficiency + T1_pct +  LoanLossProv_pct  + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct + est_RW, data = data_stata_win_reg_large, model = "within")
+
+summary(fe_win_within_large)
+```
+
+### small banks
+
+```{r, warning = FALSE}
+fe_win_within_small <- plm(RoE ~ LtD + LoanstoTA + Efficiency +  LeverageRatio + LoanLossProv_pct  + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct + est_RW, data = data_stata_win_reg_small, model = "within")
+
+summary(fe_win_within_small)
+```
+
+```{r, warning = FALSE}
+fe_win_within_small <- plm(RoE ~ LtD + LoanstoTA + Efficiency +  T1_pct + LoanLossProv_pct  + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct + est_RW, data = data_stata_win_reg_small, model = "within")
+
+summary(fe_win_within_small)
+```
+
+### interaction between large banks and LR
+
+```{r, warning = FALSE}
+fe_win_within_large_interaction <- plm(RoE ~ TA + LtD + LoanstoTA + Efficiency + LeverageRatio + LoanLossProv_pct  + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct + TA_large*LeverageRatio, data = data_stata_win_reg, model = "within")
+
+summary(fe_win_within_large_interaction)
+```
+
+Just being large or just having a high leverage ratio increases RoE. But having both decreases RoE. Hard to interpret. 
+
+```{r, warning = FALSE}
+fe_win_within_TA_interaction <- plm(RoE ~ TA + LtD + LoanstoTA + Efficiency + LeverageRatio + LoanLossProv_pct  + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct + TA*LeverageRatio, data = data_stata_win_reg, model = "within")
+
+summary(fe_win_within_TA_interaction)
+```
+
+### interaction in 'changes' regression
+
+```{r, warning = FALSE}
+fe_changes_within_TA_interaction <- plm(RoE ~ TA + LtD + LoanstoTA + Efficiency + LeverageRatio + LoanLossProv_pct  + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct + TA*LeverageRatio, data = data_stata_changes_reg, model = "within")
+
+summary(fe_changes_within_TA_interaction)
+```
+
+### plain 'changes' regression
+
+Not significant effect anymore
+
+```{r, warning = FALSE}
+fe_changes_within <- plm(RoE ~ TA + LtD + LoanstoTA + Efficiency + LeverageRatio + LoanLossProv_pct  + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_changes_reg, model = "within")
+
+summary(fe_changes_within)
+```
+
+### Pre 2015 sample
+
+Having fewer Loans to Deposits was better in "bad" times
+
+```{r, warning = FALSE}
+fe_win_within_pre <- plm(RoE ~ TA + LtD + Efficiency + LeverageRatio + LoanLossProv_pct  + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_win_reg_pre, model = "within")
+
+summary(fe_win_within_pre)
+```
+### post (inclding) 2015 sample
+
+Negative effect of LR only in recent "good" times
+
+```{r, warning = FALSE}
+fe_win_within_post <- plm(RoE ~ TA + LtD + Efficiency + LeverageRatio + LoanLossProv_pct  + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_win_reg_post, model = "within")
+
+summary(fe_win_within_post)
+```
+
+### 99% percentile winsorised sample vs 
+
+```{r, warning = FALSE}
+fe_win_within <- plm(RoE ~ TA + LtD + LoanstoTA + Efficiency + LeverageRatio + LoanLossProv_pct  + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_win_reg, model = "within")
+
+summary(fe_win_within)
+```
+
+
+## z-score >3 winsorised sample
+
+```{r, warning = FALSE}
+fe_z_win_within <- plm(RoE ~ TA + LtD + Efficiency + LeverageRatio + LoanLossProv_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_z_win_reg, model = "within")
+
+summary(fe_z_win_within)
+```
+
+```{r, warning = FALSE}
+fe_z_win_within <- plm(RoE ~ TA + LtD + Efficiency + LeverageRatio + LoanLossProv_pct + NonIntInc_pct + LoanstoTA + LongTermDebt_pct + Inflation + GDP_pct, data = data_stata_z_win_reg, model = "within")
+
+summary(fe_z_win_within)
+```
+
+## z-score >3 by year winsorised sample
+
+```{r, warning = FALSE}
+fe_z_year_win_within <- plm(RoE ~ TA + LtD + Efficiency + LeverageRatio + LoanLossProv_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_z_year_win_reg , model = "within", effect = "twoways")
+
+summary(fe_z_year_win_within)
+```
+
+### impact of estimated Risk weights
+
+on own mildly significant
+
+```{r, warning = FALSE}
+fe_z_win_within <- plm(RoE ~ TA + LtD + Efficiency + est_RW + LoanLossProv_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_z_win_reg, model = "within", effect = "twoways")
+
+summary(fe_z_win_within)
+```
+
+with LR highly significant and positive.  
+
+```{r, warning = FALSE}
+fe_z_win_within <- plm(RoE ~ TA + LtD + Efficiency + LeverageRatio + est_RW + LoanLossProv_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_z_win_reg, model = "within", effect = "twoways")
+
+summary(fe_z_win_within)
+```
+
+### year lag
+
+
+```{r, warning = FALSE}
+fe_win_lag_within <- plm(RoE ~ TA + LtD + Efficiency + LeverageRatio + NonPerfLoans_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_lag_reg, model = "within")
+
+summary(fe_win_lag_within)
+```
+
+
+## RoA
+
+
+### Pre 2015 sample
+
+Having fewer Loans to Deposits was better in "bad" times
+
+```{r, warning = FALSE}
+fe_win_within_pre <- plm(RoA ~ TA + LtD + Efficiency + LeverageRatio + LoanLossProv_pct  + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_win_reg_pre, model = "within")
+
+summary(fe_win_within_pre)
+```
+### post (including) 2015 sample
+
+Negative effect of LR only in recent "good" times
+
+```{r, warning = FALSE}
+fe_win_within_post <- plm(RoA ~ TA + LtD + Efficiency + LeverageRatio + LoanLossProv_pct  + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_win_reg_post, model = "within")
+
+summary(fe_win_within_post)
+```
+
+### 99% percentile winsorised sample vs 
+
+```{r, warning = FALSE}
+fe_win_within <- plm(RoA ~ TA + LtD + LoanstoTA + Efficiency + LeverageRatio + LoanLossProv_pct  + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_win_reg, model = "within")
+
+summary(fe_win_within)
+```
+
+
+## z-score >3 winsorised sample
+
+```{r, warning = FALSE}
+fe_z_win_within <- plm(RoA ~ TA + LtD + Efficiency + LeverageRatio + LoanLossProv_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_z_win_reg, model = "within")
+
+summary(fe_z_win_within)
+```
+
+```{r, warning = FALSE}
+fe_z_win_within <- plm(RoA ~ TA + LtD + Efficiency + LeverageRatio +  LoanLossProv_pct + NonIntInc_pct + LoanstoTA + LongTermDebt_pct + Inflation + GDP_pct, data = data_stata_z_win_reg, model = "within")
+
+summary(fe_z_win_within)
+```
+
+## z-score >3 by year winsorised sample
+
+```{r, warning = FALSE}
+fe_z_year_win_within <- plm(RoA ~ TA + LtD + Efficiency + LeverageRatio + LoanLossProv_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_z_year_win_reg , model = "within")
+
+summary(fe_z_year_win_within)
+```
+
+
+
+
+
+### Subset selection "best" model
+
+```{r, warning = FALSE}
+fe_win_within_best <- plm(RoE ~ TA + LtD +LoanstoTA + Efficiency + LeverageRatio + LoanLossProv_pct + NonPerfLoans_pct  + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_win_reg, model = "within")
+
+summary(fe_win_within_best)
+```
+
+## Comparing within with two-ways estimation
+
+```{r, warning = FALSE}
+fe_win_within <- plm(RoE ~ TA + LtD +LoanstoTA + Efficiency + LeverageRatio + LoanLossProv_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_win_reg, model = "within")
+
+summary(fe_win_within)
+```
+
+## two-ways
+
+#### RoE
+
+Removes macro factors and replaces with year dummy.
+
+```{r, warning = FALSE}
+fe_win_twoways <- plm(RoE ~ TA + Efficiency + NonIntInc_pct + LeverageRatio + LoanLossProv_pct + LtD, data = data_stata_win_reg, model = "within", effect = "twoways")
+
+coeftest(fe_win_twoways, vcov = vcovHC(fe_win_twoways, method = "white1")) #robust se
+
+summary(fe_win_twoways)
+
+reg_coef_RoE <- as.data.frame(fe_win_twoways$coefficients)
+
+reg_coeff <-  reg_coef_RoE %>%
+  mutate(variable = rownames(reg_coef_RoE)) %>%
+  rename(coefficient = 'fe_win_twoways$coefficients')
+
+data_stata_win_summary2 <- data_stata_win_summary %>%
+  mutate(variable = rownames(data_stata_win_summary),
+         IQR = `Pctl(75)` - `Pctl(25)`)
+
+reg_coeff_RoE <- reg_coeff %>%
+  left_join(data_stata_win_summary2, by = c("variable")) %>%
+  mutate(coeff_IQR = coefficient*IQR,
+         RoE_IQR = as.numeric(data_stata_win_summary2[12, 10]),
+         pct_RoE_IQR = coeff_IQR/RoE_IQR)
+  
+
+#fixef(fe_win_twoways)
+```
+
+#### RoA
+
+
+```{r, warning = FALSE}
+fe_win_twoways <- plm(RoA ~ TA + Efficiency + NonIntInc_pct + LeverageRatio + LoanLossProv_pct + LtD, data = data_stata_win_reg, model = "within", effect = "twoways")
+
+coeftest(fe_win_twoways, vcov = vcovHC(fe_win_twoways, method = "white1")) #robust se
+
+summary(fe_win_twoways)
+
+reg_coef_RoA <- as.data.frame(fe_win_twoways$coefficients)
+
+reg_coeff_RoA <-  reg_coef_RoA %>%
+  mutate(variable = rownames(reg_coef_RoA)) %>%
+  rename(coefficient = 'fe_win_twoways$coefficients')
+
+data_stata_win_summary2 <- data_stata_win_summary %>%
+  mutate(variable = rownames(data_stata_win_summary),
+         IQR = `Pctl(75)` - `Pctl(25)`)
+
+reg_coeff_RoA <- reg_coeff_RoA %>%
+  left_join(data_stata_win_summary2, by = c("variable")) %>%
+  mutate(coeff_IQR = coefficient*IQR,
+         RoA_IQR = as.numeric(data_stata_win_summary2[11, 10]),
+         pct_RoA_IQR = coeff_IQR/RoA_IQR)
+  
+
+#fixef(fe_win_twoways)
+```
+
+#### RoE
+
+```{r, warning = FALSE}
+fe_win_twoways <- plm(RoE ~ TA + Efficiency + NonIntInc_pct + LeverageRatio + LoanLossProv_pct + LtD, data = data_stata_win_reg, model = "within", effect = "twoways")
+
+summary(fe_win_twoways)
+
+plmtest(fe_win_twoways, effect = "twoways")
+
+
+pooling <- plm(RoE ~ TA + Efficiency + NonIntInc_pct + LeverageRatio + LoanLossProv_pct + LtD, data = data_stata_win_reg, model = "pooling")
+
+pFtest(RoE ~ TA + Efficiency + NonIntInc_pct + LeverageRatio + LoanLossProv_pct + LtD, data = data_stata_win_reg, effect = "twoways")
+
+pFtest(fe_win_twoways, pooling)
+```
+
+### Impact of RW
+
+#### RoE
+
+```{r, warning = FALSE}
+fe_win_twoways <- plm(RoE ~ TA + Efficiency + NonIntInc_pct + LeverageRatio + est_RW + LoanLossProv_pct + LtD, data = data_stata_win_reg, model = "within", effect = "twoways")
+
+coeftest(fe_win_twoways, vcov = vcovHC(fe_win_twoways, method = "white1")) #robust se
+```
+
+```{r, warning = FALSE}
+fe_win_twoways <- plm(RoE ~ TA + Efficiency + NonIntInc_pct + T1_pct + est_RW + LoanLossProv_pct + LtD, data = data_stata_win_reg, model = "within", effect = "twoways")
+
+coeftest(fe_win_twoways, vcov = vcovHC(fe_win_twoways, method = "white1")) #robust se
+```
+```{r, warning = FALSE}
+fe_win_twoways <- plm(RoE ~ TA + Efficiency + NonIntInc_pct + est_RW + LoanLossProv_pct + LtD, data = data_stata_win_reg, model = "within", effect = "twoways")
+
+coeftest(fe_win_twoways, vcov = vcovHC(fe_win_twoways, method = "white1")) #robust se
+```
+
+#### RoA
+
+Both LR and RW have positive impact on RoA. Increasing LR positive even if controlling for extra risk taking vie RW. 
+
+```{r, warning = FALSE}
+fe_win_within <- plm(RoA ~ TA + LtD + Efficiency + LeverageRatio + est_RW + LoanLossProv_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_win_reg, model = "within", effect = "twoways")
+
+summary(fe_win_within)
+```
+
+
+```{r, warning = FALSE}
+fe_win_within <- plm(RoA ~ TA + LtD + Efficiency + T1_pct + est_RW + LoanLossProv_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_win_reg, model = "within", effect = "twoways")
+
+coeftest(fe_win_twoways, vcov = vcovHC(fe_win_twoways, method = "white1")) #robust se
+```
+
+```{r, warning = FALSE}
+fe_win_twoways <- plm(RoA ~ TA + Efficiency + NonIntInc_pct + est_RW + LoanLossProv_pct + LtD, data = data_stata_win_reg, model = "within", effect = "twoways")
+
+coeftest(fe_win_twoways, vcov = vcovHC(fe_win_twoways, method = "white1")) #robust se
+```
+
+### test
+
+```{r, warning = FALSE}
+test2 <- read.csv("test_2.csv")
+
+test2 <- lm(intercept ~ GDP_pct + Inflation, data = test2)
+
+summary(test2)
+
+```
+
+
+## On non-winsorised sample
+
+```{r, warning = FALSE}
+fe_within <- plm(RoE ~ TA + LtD +LoanstoTA + Efficiency + T1_pct + LoanLossProv_pct +  + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_reg, model = "within")
+
+summary(fe_within)
+```
+
+### With size in 5 buckets
+```{r, warning = FALSE}
+fe_within_size_buckets <- plm(RoE ~ TA_1 + TA_2 + TA_3 + TA_4 + LtD + LoanstoTA + Efficiency + T1_pct + LoanLossProv_pct + LongTermDebt_pct + NonIntInc_pct + Inflation + GDP_pct, data = data_stata_reg, model = "within")
+
+summary(fe_within_size_buckets)
+```
+
+
+## Reg on rows with winsorised variables
+
+```{r, warning = FALSE}
+fe_win_nowin <- plm(roe ~ ta + ltd +loanstota + efficiency + t1_pct + loanlossprov_pct +  + longtermdebt_pct + nonintinc_pct + inflation + gdp_pct, data = residual_win_reg, model = "within")
+
+summary(fe_win_nowin)
+```
+
+
+
+
+## heteroskedasticity
+
+```{r, warning = FALSE}
+residual_two_way %>%
+  ggplot(aes(x = fited_roe, y = roe)) +
+  geom_point()
+```
+
+```{r, warning = FALSE}
+residual_two_way %>%
+  ggplot(aes(x = roe, y = r_roe)) +
+  geom_point()
+```
+
+## results charts
+
+```{r, warning = FALSE}
+econ_sig_roe %>% 
+  mutate(variable = factor(variable, levels(variable)[c(6, 5, 4, 3, 2, 1)],
+                           labels = c("Size", "Diversification", "Loans to Deposits", "Loan Loss Provisions", "Leverage Ratio",  "Efficiency")),
+         variable = fct_reorder(variable, coeff_IQR)) %>%
+  ggplot(aes(x = variable, y = coeff_IQR)) +
+  geom_col(fill = "lightblue") +
+  scale_y_continuous(breaks = seq(-4,2,1)) +
+  geom_errorbar(aes(ymin=lower_CI_coeff_IQR, ymax=upper_CI_coeff_IQR),
+                  width=.5                    
+                  ) +
+  theme_bw() +
+  theme(axis.title.y = element_blank(), panel.grid.minor.x = element_blank()) +
+  labs(y = "Impact on RoE") +
+  coord_flip()
+```
+
+
+```{r, warning = FALSE}
+econ_sig_roa %>% 
+  mutate(variable = factor(variable, levels(variable)[c(6, 5, 4, 3, 2, 1)],
+                           labels = c("Size", "Diversification", "Loans to Deposits", "Loan Loss Provisions", "Leverage Ratio",  "Efficiency")),
+  variable = fct_reorder(variable, coeff_IQR)) %>%
+  ggplot(aes(x = variable, y = coeff_IQR)) +
+  geom_col(fill = "lightblue") +
+  scale_y_continuous(breaks = seq(-0.4,0.2,0.1)) +
+  geom_errorbar(aes(ymin=lower_CI_coeff_IQR, ymax=upper_CI_coeff_IQR),
+                  width=.5                    
+                  ) +
+  theme_bw() +
+  theme(axis.title.y = element_blank(), panel.grid.minor.x = element_blank()) +
+  labs(y = "Impact on RoA") +
+  coord_flip()
+```
